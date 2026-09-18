@@ -1,0 +1,11 @@
+* text=auto
+
+*.cs text eol=lf
+*.csproj text eol=lf
+*.sln text eol=crlf
+*.godot text eol=lf
+*.tscn text eol=lf
+*.tres text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.sh text eol=lf

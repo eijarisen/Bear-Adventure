@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Bear Adventure (Godot)",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "program": "${env:GODOT4}",
+      "args": [
+        "--path",
+        "${workspaceFolder}/game"
+      ],
+      "cwd": "${workspaceFolder}/game",
+      "stopAtEntry": false
+    }
+  ]
+}

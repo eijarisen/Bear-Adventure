@@ -1,0 +1,16 @@
+{
+  "editor.formatOnSave": true,
+  "files.exclude": {
+    "**/.godot": true,
+    "**/bin": true,
+    "**/obj": true
+  },
+  "search.exclude": {
+    "**/.godot": true,
+    "**/bin": true,
+    "**/obj": true
+  },
+  "[csharp]": {
+    "editor.defaultFormatter": "ms-dotnettools.csharp"
+  }
+}
