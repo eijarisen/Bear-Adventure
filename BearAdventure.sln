@@ -4,6 +4,10 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BearAdventure", "game\BearAdventure.csproj", "{A6E3B4A8-3CA7-4E24-81EF-5F0D1CFDC3C8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BearAdventure.Domain", "src\BearAdventure.Domain\BearAdventure.Domain.csproj", "{D4E221BC-27D2-4EA5-AE2C-C4E72ED3145F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BearAdventure.Persistence", "src\BearAdventure.Persistence\BearAdventure.Persistence.csproj", "{5A313F1D-7390-49A8-81F9-DAB5F9B6803F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -14,6 +18,14 @@ Global
 		{A6E3B4A8-3CA7-4E24-81EF-5F0D1CFDC3C8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A6E3B4A8-3CA7-4E24-81EF-5F0D1CFDC3C8}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A6E3B4A8-3CA7-4E24-81EF-5F0D1CFDC3C8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D4E221BC-27D2-4EA5-AE2C-C4E72ED3145F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D4E221BC-27D2-4EA5-AE2C-C4E72ED3145F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D4E221BC-27D2-4EA5-AE2C-C4E72ED3145F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D4E221BC-27D2-4EA5-AE2C-C4E72ED3145F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5A313F1D-7390-49A8-81F9-DAB5F9B6803F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5A313F1D-7390-49A8-81F9-DAB5F9B6803F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5A313F1D-7390-49A8-81F9-DAB5F9B6803F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5A313F1D-7390-49A8-81F9-DAB5F9B6803F}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
