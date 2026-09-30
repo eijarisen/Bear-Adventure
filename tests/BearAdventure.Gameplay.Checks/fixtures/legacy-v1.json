@@ -1,0 +1,15 @@
+{
+  "FormatVersion": 1,
+  "GeneratorVersion": 1,
+  "WorldSeed": "legacy-fixture-12-14",
+  "CurrentIslandId": 0,
+  "DiscoveredIslandIds": [0, 1],
+  "Inventory": {"Wood": 23, "Axe": 1, "Pickaxe": 1, "Honey": 2},
+  "Islands": {"0": {
+    "HarvestedNaturalFeatureIds": [],
+    "NaturalRegrowthSeconds": {},
+    "PlacedObjects": [{"PlacementId": 1,"Item":"Chest","CellX":20,"LogicalLevel":1,"Layer":"Solid","GrowthSeconds":0,"ProductionSeconds":0,"StoredOutput":0}],
+    "LeftBoatBuilt": true, "RightBoatBuilt": false,
+    "MinedUndergroundCells": [], "LootedGeneratedChestIds": []
+  }}
+}

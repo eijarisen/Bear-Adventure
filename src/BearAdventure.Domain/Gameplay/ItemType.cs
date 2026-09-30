@@ -34,4 +34,6 @@ public enum ItemType
     Juice,
     Soup,
     Banana,
+    Fish,
+    FishingRod,
 }

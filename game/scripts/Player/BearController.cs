@@ -1,4 +1,6 @@
+using BearAdventure.Domain.Gameplay;
 using Godot;
+using BearAdventure.Rendering.PixelArt;
 
 namespace BearAdventure.Player;
 
@@ -24,7 +26,19 @@ public partial class BearController : CharacterBody2D
     private float _landRightX;
     private Vector2 _respawnPosition;
 
+    public WorldInputState? InputState { get; set; }
     public bool MovementLocked { get; set; }
+    public bool FishingActive { get; set; }
+    public Func<Vector2>? SafeRespawn { get; set; }
+    public void CancelMotion()
+    {
+        Velocity=Vector2.Zero; MovementLocked=false; FishingActive=false; _coyoteRemaining=0; _jumpBufferRemaining=0; _jumpWasDown=true;
+    }
+    public void PlaceAt(Vector2 position)
+    {
+        Position=position; CancelMotion();
+        GetNodeOrNull<Camera2D>("Camera")?.ResetSmoothing();
+    }
 
     public bool ClimbEnabled { get; set; }
 
@@ -82,24 +96,11 @@ public partial class BearController : CharacterBody2D
 
     public override void _PhysicsProcess(double delta)
     {
-        bool left =
-            Input.IsPhysicalKeyPressed(Key.A)
-            || Input.IsPhysicalKeyPressed(Key.Left);
-
-        bool right =
-            Input.IsPhysicalKeyPressed(Key.D)
-            || Input.IsPhysicalKeyPressed(Key.Right);
-
-        bool up =
-            Input.IsPhysicalKeyPressed(Key.W)
-            || Input.IsPhysicalKeyPressed(Key.Up);
-
-        bool down =
-            Input.IsPhysicalKeyPressed(Key.S)
-            || Input.IsPhysicalKeyPressed(Key.Down);
-
-        bool space =
-            Input.IsPhysicalKeyPressed(Key.Space);
+        bool left = InputState?.Held(GameAction.Left) ?? false;
+        bool right = InputState?.Held(GameAction.Right) ?? false;
+        bool up = InputState?.Held(GameAction.Up) ?? false;
+        bool down = InputState?.Held(GameAction.Down) ?? false;
+        bool space = InputState?.Held(GameAction.Jump) ?? false;
 
         bool jumpDown =
             space
@@ -226,6 +227,7 @@ public partial class BearController : CharacterBody2D
         {
             Respawn();
         }
+        if (Position.Y > 4896.0f) Respawn();
 
         if (Math.Abs(Velocity.X) > 8.0f
             && IsOnFloor())
@@ -239,85 +241,48 @@ public partial class BearController : CharacterBody2D
 
     public override void _Draw()
     {
-        float bob =
-            IsOnFloor() && Math.Abs(Velocity.X) > 8.0f
-                ? Mathf.Sin(_walkCycle * 2.0f) * 1.4f
-                : 0.0f;
-
-        float step = Mathf.Sin(_walkCycle) * 5.0f;
-        Color fur = new(0.48f, 0.28f, 0.13f);
-        Color darkFur = new(0.30f, 0.16f, 0.07f);
-        Color muzzle = new(0.72f, 0.51f, 0.31f);
-        Color black = new(0.05f, 0.05f, 0.05f);
-
-        DrawLine(
-            new Vector2(-9.0f, 19.0f + bob),
-            new Vector2(-10.0f + step, 29.0f),
-            darkFur,
-            8.0f,
-            true);
-        DrawLine(
-            new Vector2(9.0f, 19.0f + bob),
-            new Vector2(10.0f - step, 29.0f),
-            darkFur,
-            8.0f,
-            true);
-
-        DrawCircle(
-            new Vector2(0.0f, 5.0f + bob),
-            21.0f,
-            fur);
-        DrawCircle(
-            new Vector2(-11.0f, -20.0f + bob),
-            8.0f,
-            darkFur);
-        DrawCircle(
-            new Vector2(11.0f, -20.0f + bob),
-            8.0f,
-            darkFur);
-        DrawCircle(
-            new Vector2(0.0f, -12.0f + bob),
-            18.0f,
-            fur);
-        DrawCircle(
-            new Vector2(4.0f * _facing, -7.0f + bob),
-            8.0f,
-            muzzle);
-        DrawCircle(
-            new Vector2(8.0f * _facing, -10.0f + bob),
-            2.3f,
-            black);
-        DrawCircle(
-            new Vector2(5.0f * _facing, -17.0f + bob),
-            2.0f,
-            black);
-        DrawCircle(
-            new Vector2(-4.5f * _facing, -17.5f + bob),
-            1.7f,
-            black);
-
-        float armSwing =
-            Math.Abs(Velocity.X) > 8.0f
-                ? Mathf.Sin(_walkCycle) * 6.0f
-                : 0.0f;
-
-        DrawLine(
-            new Vector2(-17.0f, 1.0f + bob),
-            new Vector2(-22.0f, 13.0f + armSwing + bob),
-            fur,
-            7.0f,
-            true);
-        DrawLine(
-            new Vector2(17.0f, 1.0f + bob),
-            new Vector2(22.0f, 13.0f - armSwing + bob),
-            fur,
-            7.0f,
-            true);
+        // Read-only presentation. The collider and all movement constants remain unchanged.
+        double clock = Time.GetTicksMsec() / 1000.0;
+        string pose;
+        int frame;
+        if (MovementLocked)
+        {
+            pose = "work";
+            frame = (int)(clock * 7.0) % 4;
+        }
+        else if (ClimbEnabled && !IsOnFloor())
+        {
+            pose = "climb";
+            frame = Math.Abs(Velocity.Y) > 8.0f ? (int)(clock * 7.0) % 4 : 0;
+        }
+        else if (!IsOnFloor())
+        {
+            pose = "jump";
+            frame = Velocity.Y < 0 ? 0 : 1;
+        }
+        else if (Math.Abs(Velocity.X) > 8.0f)
+        {
+            pose = "walk";
+            frame = (int)(_walkCycle * 1.8f) % 8;
+        }
+        else
+        {
+            pose = "idle";
+            frame = clock % 7.0 > 6.82 ? 3 : (int)(clock * 1.5) % 3;
+        }
+        PixelAtlas.DrawBottom(this, $"bear/{pose}/{frame}", new Vector2(0, 31),
+            flip: _facing < 0);
+        if(FishingActive)
+        {
+            float side=24*_facing;
+            PixelAtlas.DrawBottom(this,"icon/FishingRod",new Vector2(side,15),0.9f);
+            DrawLine(new Vector2(side+8*_facing,-2),new Vector2(side+34*_facing,32),PixelAtlas.ToColor(PxColor.Panel1),2);
+        }
     }
 
     private void Respawn()
     {
-        Position = _respawnPosition;
+        Position = SafeRespawn?.Invoke() ?? _respawnPosition;
         Velocity = Vector2.Zero;
         _coyoteRemaining = 0.0;
         _jumpBufferRemaining = 0.0;

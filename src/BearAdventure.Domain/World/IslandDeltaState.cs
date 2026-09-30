@@ -4,7 +4,7 @@ namespace BearAdventure.Domain.World;
 
 /// <summary>
 /// Persistent changes layered over a deterministically generated island.
-/// The untouched island itself is not serialized.
+/// The materialized generation baseline is stored separately from these edits.
 /// </summary>
 public sealed class IslandDeltaState
 {
@@ -14,6 +14,38 @@ public sealed class IslandDeltaState
     private readonly HashSet<UndergroundCell> _minedUndergroundCells = new();
     private readonly HashSet<int> _lootedGeneratedChestIds = new();
     private int _nextPlacementId = 1;
+    private readonly Dictionary<int, InventoryState> _generatedChestContents = new();
+    public IReadOnlyDictionary<int, InventoryState> GeneratedChestContents => _generatedChestContents;
+    public long Revision { get; private set; }
+    public int NextPlacementId => _nextPlacementId;
+    public void Touch() => Revision++;
+    public void SetNextPlacementId(int value)
+    {
+        if (value < _nextPlacementId || value < 1 || value == int.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(value));
+        _nextPlacementId = value;
+    }
+    public InventoryState OpenGeneratedChest(GeneratedChestDefinition chest)
+    {
+        if (_generatedChestContents.TryGetValue(chest.ChestId, out var existing)) return existing;
+        var result = new InventoryState();
+        if (!IsGeneratedChestLooted(chest.ChestId)) result.ReplaceWith(chest.Loot);
+        _generatedChestContents.Add(chest.ChestId, result);
+        Touch(); return result;
+    }
+    public void RestoreGeneratedChest(int id, InventoryState inventory)
+    { _generatedChestContents.Add(id, inventory); }
+    public void SetRegrowthRemaining(int id, double seconds)
+    {
+        if (!_harvestedNaturalFeatureIds.Contains(id) || !double.IsFinite(seconds) || seconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(seconds));
+        _naturalRegrowthSeconds[id] = seconds;
+    }
+    public void CompleteRegrowth(int id)
+    {
+        _naturalRegrowthSeconds.Remove(id); _harvestedNaturalFeatureIds.Remove(id); Touch();
+    }
+
 
     public IReadOnlySet<int> HarvestedNaturalFeatureIds
         => _harvestedNaturalFeatureIds;
@@ -64,41 +96,8 @@ public sealed class IslandDeltaState
             _naturalRegrowthSeconds.Remove(featureId);
         }
 
+        Touch();
         return true;
-    }
-
-    public bool AdvanceNaturalRegrowth(double deltaSeconds)
-    {
-        if (deltaSeconds <= 0.0
-            || _naturalRegrowthSeconds.Count == 0)
-        {
-            return false;
-        }
-
-        bool changed = false;
-        int[] featureIds =
-            _naturalRegrowthSeconds.Keys.ToArray();
-
-        foreach (int featureId in featureIds)
-        {
-            double remaining =
-                _naturalRegrowthSeconds[featureId]
-                - deltaSeconds;
-
-            if (remaining <= 0.0)
-            {
-                _naturalRegrowthSeconds.Remove(featureId);
-                _harvestedNaturalFeatureIds.Remove(featureId);
-                changed = true;
-            }
-            else
-            {
-                _naturalRegrowthSeconds[featureId] =
-                    remaining;
-            }
-        }
-
-        return changed;
     }
 
     public void ReplaceHarvestedNaturalFeatures(
@@ -126,7 +125,7 @@ public sealed class IslandDeltaState
         foreach ((int featureId, double remaining) in regrowth)
         {
             if (featureId < 0
-                || remaining <= 0.0)
+                || !double.IsFinite(remaining) || remaining < 0.0)
             {
                 continue;
             }
@@ -143,6 +142,7 @@ public sealed class IslandDeltaState
         int logicalLevel,
         BuildLayer layer)
     {
+        if (_nextPlacementId >= int.MaxValue - 1) throw new InvalidOperationException("Placement identity limit reached.");
         var placed =
             new PlacedObjectState(
                 _nextPlacementId++,
@@ -152,6 +152,7 @@ public sealed class IslandDeltaState
                 layer);
 
         _placedObjects.Add(placed);
+        Touch();
         return placed;
     }
 
@@ -168,6 +169,7 @@ public sealed class IslandDeltaState
         }
 
         _placedObjects.RemoveAt(index);
+        Touch();
         return true;
     }
 
@@ -207,7 +209,9 @@ public sealed class IslandDeltaState
     public bool MarkUndergroundCellMined(
         UndergroundCell cell)
     {
-        return _minedUndergroundCells.Add(cell);
+        bool added = _minedUndergroundCells.Add(cell);
+        if (added) Touch();
+        return added;
     }
 
     public void ReplaceMinedUndergroundCells(

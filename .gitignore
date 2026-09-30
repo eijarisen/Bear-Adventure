@@ -23,3 +23,6 @@ game/.godot/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Standalone exports
+/build/

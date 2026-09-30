@@ -2,172 +2,48 @@ namespace BearAdventure.Domain.Gameplay;
 
 public static class StationCraftingService
 {
-    private static readonly IReadOnlyList<StationRecipeDefinition> ForgeRecipes =
-    [
-        new(
-            "iron-bar",
-            "Iron Bar",
-            "1 iron ore + 1 wood"),
-    ];
-
-    private static readonly IReadOnlyList<StationRecipeDefinition> AnvilRecipes =
-    [
-        new(
-            "iron-axe",
-            "Iron Axe",
-            "1 axe + 10 iron bars + 5 wood"),
-
-        new(
-            "iron-pickaxe",
-            "Iron Pickaxe",
-            "1 pickaxe + 15 iron bars + 5 wood"),
-    ];
-
-    private static readonly IReadOnlyList<StationRecipeDefinition> CauldronRecipes =
-    [
-        new(
-            "juice",
-            "Juice",
-            "1 cactus + 1 flower"),
-
-        new(
-            "soup",
-            "Soup",
-            "1 brown mushroom + 1 flower"),
-    ];
-
-    public static IReadOnlyList<StationRecipeDefinition> GetRecipes(
-        ItemType station)
+    public static IReadOnlyList<StationRecipeDefinition> GetRecipes(ItemType station) => station switch
     {
-        return station switch
+        ItemType.Forge => new[] { new StationRecipeDefinition("iron-bar", "Iron Bar", "1 iron ore + 1 wood") },
+        ItemType.Anvil => new[] {
+            new StationRecipeDefinition("iron-axe", "Iron Axe", "1 axe + 10 iron bars + 5 wood"),
+            new StationRecipeDefinition("iron-pickaxe", "Iron Pickaxe", "1 pickaxe + 15 iron bars + 5 wood") },
+        ItemType.Cauldron => new[] {
+            new StationRecipeDefinition("juice", "Juice", "1 cactus + 1 selected flower"),
+            new StationRecipeDefinition("soup", "Soup", "1 brown mushroom + 1 selected flower"),
+            new StationRecipeDefinition("red-soup", "Red Mushroom Soup", "1 red mushroom + 1 selected flower") },
+        _ => Array.Empty<StationRecipeDefinition>()
+    };
+    public static CraftingRecipe? Resolve(ItemType station, string id, ItemType? flower = null)
+    {
+        Dictionary<ItemType,int> Cost(params (ItemType Item, int Count)[] entries) =>
+            entries.ToDictionary(e => e.Item, e => e.Count);
+        CraftingRecipe Recipe(string name, ItemType output, Dictionary<ItemType,int> cost) =>
+            new(id, name, cost, new Dictionary<ItemType,int> { [output] = 1 });
+        return (station, id) switch
         {
-            ItemType.Forge => ForgeRecipes,
-            ItemType.Anvil => AnvilRecipes,
-            ItemType.Cauldron => CauldronRecipes,
-            _ => Array.Empty<StationRecipeDefinition>(),
+            (ItemType.Forge, "iron-bar") => Recipe("Iron Bar", ItemType.IronBar, Cost((ItemType.IronOre,1),(ItemType.Wood,1))),
+            (ItemType.Anvil, "iron-axe") => Recipe("Iron Axe", ItemType.IronAxe,
+                Cost((ItemType.Axe,1),(ItemType.IronBar,10),(ItemType.Wood,5))),
+            (ItemType.Anvil, "iron-pickaxe") => Recipe("Iron Pickaxe", ItemType.IronPickaxe,
+                Cost((ItemType.Pickaxe,1),(ItemType.IronBar,15),(ItemType.Wood,5))),
+            (ItemType.Cauldron, "juice") when flower.HasValue && PlacementRules.IsFlower(flower.Value) =>
+                Recipe("Juice", ItemType.Juice, Cost((ItemType.Cactus,1),(flower.Value,1))),
+            (ItemType.Cauldron, "soup") when flower.HasValue && PlacementRules.IsFlower(flower.Value) =>
+                Recipe("Soup", ItemType.Soup, Cost((ItemType.MushroomBrown,1),(flower.Value,1))),
+            (ItemType.Cauldron, "red-soup") when flower.HasValue && PlacementRules.IsFlower(flower.Value) =>
+                Recipe("Red Mushroom Soup", ItemType.Soup, Cost((ItemType.MushroomRed,1),(flower.Value,1))),
+            _ => null
         };
     }
-
-    public static bool CanCraft(
-        InventoryState inventory,
-        ItemType station,
-        string recipeId)
+    public static bool CanCraft(InventoryState inventory, ItemType station, string recipeId, ItemType? flower = null)
     {
-        ArgumentNullException.ThrowIfNull(inventory);
-        ArgumentException.ThrowIfNullOrWhiteSpace(recipeId);
-
-        return (station, recipeId) switch
-        {
-            (ItemType.Forge, "iron-bar") =>
-                inventory.Has(ItemType.IronOre)
-                && inventory.Has(ItemType.Wood),
-
-            (ItemType.Anvil, "iron-axe") =>
-                inventory.Has(ItemType.Axe)
-                && inventory.Has(ItemType.IronBar, 10)
-                && inventory.Has(ItemType.Wood, 5),
-
-            (ItemType.Anvil, "iron-pickaxe") =>
-                inventory.Has(ItemType.Pickaxe)
-                && inventory.Has(ItemType.IronBar, 15)
-                && inventory.Has(ItemType.Wood, 5),
-
-            (ItemType.Cauldron, "juice") =>
-                inventory.Has(ItemType.Cactus)
-                && HasAnyFlower(inventory),
-
-            (ItemType.Cauldron, "soup") =>
-                inventory.Has(ItemType.MushroomBrown)
-                && HasAnyFlower(inventory),
-
-            _ => false,
-        };
+        var recipe = Resolve(station, recipeId, flower);
+        return recipe is not null && CraftingService.CanCraft(inventory, recipe);
     }
-
-    public static bool TryCraft(
-        InventoryState inventory,
-        ItemType station,
-        string recipeId)
+    public static bool TryCraft(InventoryState inventory, ItemType station, string recipeId, ItemType? flower = null)
     {
-        if (!CanCraft(
-            inventory,
-            station,
-            recipeId))
-        {
-            return false;
-        }
-
-        switch (station, recipeId)
-        {
-            case (ItemType.Forge, "iron-bar"):
-                inventory.Add(ItemType.IronOre, -1);
-                inventory.Add(ItemType.Wood, -1);
-                inventory.Add(ItemType.IronBar, 1);
-                return true;
-
-            case (ItemType.Anvil, "iron-axe"):
-                inventory.Add(ItemType.Axe, -1);
-                inventory.Add(ItemType.IronBar, -10);
-                inventory.Add(ItemType.Wood, -5);
-                inventory.Add(ItemType.IronAxe, 1);
-                return true;
-
-            case (ItemType.Anvil, "iron-pickaxe"):
-                inventory.Add(ItemType.Pickaxe, -1);
-                inventory.Add(ItemType.IronBar, -15);
-                inventory.Add(ItemType.Wood, -5);
-                inventory.Add(ItemType.IronPickaxe, 1);
-                return true;
-
-            case (ItemType.Cauldron, "juice"):
-                inventory.Add(ItemType.Cactus, -1);
-                ConsumeAnyFlower(inventory);
-                inventory.Add(ItemType.Juice, 1);
-                return true;
-
-            case (ItemType.Cauldron, "soup"):
-                inventory.Add(ItemType.MushroomBrown, -1);
-                ConsumeAnyFlower(inventory);
-                inventory.Add(ItemType.Soup, 1);
-                return true;
-
-            default:
-                return false;
-        }
+        var recipe = Resolve(station, recipeId, flower);
+        return recipe is not null && CraftingService.TryCraft(inventory, recipe);
     }
-
-    private static bool HasAnyFlower(
-        InventoryState inventory)
-    {
-        return FlowerItems.Any(
-            flower => inventory.Has(flower));
-    }
-
-    private static void ConsumeAnyFlower(
-        InventoryState inventory)
-    {
-        foreach (ItemType flower in FlowerItems)
-        {
-            if (!inventory.Has(flower))
-            {
-                continue;
-            }
-
-            inventory.Add(flower, -1);
-            return;
-        }
-
-        throw new InvalidOperationException(
-            "A flower was expected but none was available.");
-    }
-
-    private static ItemType[] FlowerItems { get; } =
-    [
-        ItemType.RedFlower,
-        ItemType.YellowFlower,
-        ItemType.BlueFlower,
-        ItemType.OrangeFlower,
-        ItemType.PurpleFlower,
-        ItemType.PinkFlower,
-    ];
 }

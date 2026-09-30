@@ -57,7 +57,12 @@ public static class HarvestRules
 
     public static IReadOnlyList<HarvestReward> GetRewards(
         NaturalFeatureSpawn feature,
-        InventoryState inventory)
+        InventoryState inventory) => GetRewards(feature, inventory, BiomeType.Forest);
+
+    public static IReadOnlyList<HarvestReward> GetRewards(
+        NaturalFeatureSpawn feature,
+        InventoryState inventory,
+        BiomeType biome)
     {
         ArgumentNullException.ThrowIfNull(inventory);
 
@@ -89,7 +94,8 @@ public static class HarvestRules
             NaturalFeatureKind.Rock =>
                 RockRewards(
                     feature,
-                    inventory),
+                    inventory,
+                    biome),
 
             NaturalFeatureKind.Flower =>
             [
@@ -289,7 +295,8 @@ public static class HarvestRules
 
     private static IReadOnlyList<HarvestReward> RockRewards(
         NaturalFeatureSpawn feature,
-        InventoryState inventory)
+        InventoryState inventory,
+        BiomeType biome)
     {
         bool diamond =
             inventory.Has(
@@ -305,6 +312,11 @@ public static class HarvestRules
                 ? 2
                 : 1;
 
+        ItemType baseMaterial =
+            biome == BiomeType.Desert
+                ? ItemType.Sandstone
+                : ItemType.Stone;
+
         bool hasIron =
             ironTool
             || StablePercent(
@@ -317,7 +329,7 @@ public static class HarvestRules
             return
             [
                 new HarvestReward(
-                    ItemType.Stone,
+                    baseMaterial,
                     stone),
             ];
         }
@@ -325,7 +337,7 @@ public static class HarvestRules
         return
         [
             new HarvestReward(
-                ItemType.Stone,
+                baseMaterial,
                 stone),
             new HarvestReward(
                 ItemType.IronOre,

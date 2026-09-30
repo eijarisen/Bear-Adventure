@@ -8,455 +8,75 @@ namespace BearAdventure.Interaction;
 
 public partial class BuildingController : Node2D
 {
-    private const float MaximumBuildDistance = 320.0f;
-
     private BearController? _player;
     private IslandView? _island;
     private InventoryState? _inventory;
-
-    private ItemType? _selectedItem;
-    private BuildLayer _buildLayer = BuildLayer.Solid;
-    private bool _layerKeyWasDown;
-
-    private bool _leftMouseHeld;
-    private bool _rightMouseHeld;
-    private BuildPointerCell? _lastPlaceAttempt;
-    private CellPointer? _lastRemoveAttempt;
-
+    private WorldInputState? _input;
+    private double _repeat;
+    private UndergroundCell? _lastCell;
+    private string _lastMessage="";
+    public ItemType? SelectedItem {get;private set;}
+    public BuildLayer Layer {get;private set;} = BuildLayer.Solid;
     public event Action<string>? StatusMessage;
-
-    public event Action? InventoryChanged;
-
-    public event Action? IslandChanged;
-
-    public event Action<ItemType?, BuildLayer>? SelectionChanged;
-
-    public ItemType? SelectedItem => _selectedItem;
-
-    public BuildLayer Layer => _buildLayer;
-
-    public void Configure(
-        BearController player,
-        IslandView island,
-        InventoryState inventory)
+    public event Action? Changed;
+    public event Action<ItemType?,BuildLayer>? SelectionChanged;
+    public void Configure(BearController player,IslandView island,InventoryState inventory,WorldInputState input)
     {
-        _player =
-            player
-            ?? throw new ArgumentNullException(nameof(player));
-        _island =
-            island
-            ?? throw new ArgumentNullException(nameof(island));
-        _inventory =
-            inventory
-            ?? throw new ArgumentNullException(nameof(inventory));
-
-        _leftMouseHeld = false;
-        _rightMouseHeld = false;
-        _lastPlaceAttempt = null;
-        _lastRemoveAttempt = null;
-
-        if (_selectedItem is not null
-            && _inventory.Get(_selectedItem.Value) <= 0)
-        {
-            ClearSelection();
-        }
-
-        UpdatePreview();
+        _player=player; _island=island; _inventory=inventory; _input=input; CancelActions();
+        if(SelectedItem.HasValue && !inventory.Has(SelectedItem.Value)) ClearSelection();
     }
-
-    public void DetachIsland()
-    {
-        _island?.ClearBuildPreview();
-
-        _leftMouseHeld = false;
-        _rightMouseHeld = false;
-        _lastPlaceAttempt = null;
-        _lastRemoveAttempt = null;
-        _island = null;
-    }
-
+    public void CancelActions() { _repeat=0; _lastCell=null; _lastMessage=""; _island?.ClearBuildPreview(); }
+    public void DetachIsland() { CancelActions(); _island=null; }
     public void SelectItem(ItemType item)
     {
-        if (_inventory is null)
-        {
-            return;
-        }
-
-        if (!PlacementRules.IsPlaceable(item))
-        {
-            StatusMessage?.Invoke(
-                $"{PlacementRules.GetDisplayName(item)} cannot be placed.");
-            return;
-        }
-
-        if (_inventory.Get(item) <= 0)
-        {
-            StatusMessage?.Invoke(
-                $"No {PlacementRules.GetDisplayName(item)} available.");
-            return;
-        }
-
-        _selectedItem = item;
-
-        if (!PlacementRules.UsesBuildLayer(item))
-        {
-            _buildLayer = BuildLayer.Solid;
-        }
-
-        _lastPlaceAttempt = null;
-
-        SelectionChanged?.Invoke(
-            _selectedItem,
-            _buildLayer);
-
-        UpdatePreview();
+        if(_inventory is null || !_inventory.Has(item) || !PlacementRules.IsPlaceable(item)) return;
+        SelectedItem=item; if(!PlacementRules.UsesBuildLayer(item)) Layer=BuildLayer.Solid;
+        SelectionChanged?.Invoke(SelectedItem,Layer); CancelActions();
     }
-
-    public void ClearSelection()
+    public void ClearSelection() { SelectedItem=null; CancelActions(); SelectionChanged?.Invoke(null,Layer); }
+    public override void _PhysicsProcess(double delta)
     {
-        _selectedItem = null;
-        _lastPlaceAttempt = null;
-        _island?.ClearBuildPreview();
-
-        SelectionChanged?.Invoke(
-            null,
-            _buildLayer);
-    }
-
-    public override void _Process(double delta)
-    {
-        _ = delta;
-
-        bool layerDown =
-            Input.IsPhysicalKeyPressed(Key.Q);
-
-        if (layerDown
-            && !_layerKeyWasDown
-            && _selectedItem is not null
-            && PlacementRules.UsesBuildLayer(
-                _selectedItem.Value))
+        if(_input is null || _island is null || _inventory is null || _player is null || _input.Blocked || _input.AwaitingRelease) return;
+        if(_input.ConsumePress(GameAction.Layer) && SelectedItem.HasValue && PlacementRules.UsesBuildLayer(SelectedItem.Value))
+        { Layer=Layer==BuildLayer.Solid?BuildLayer.Background:BuildLayer.Solid; SelectionChanged?.Invoke(SelectedItem,Layer); }
+        var mouse=IslandView.Point(GetGlobalMousePosition()); var cell=WorldGrid.CellAt(mouse);
+        var actor=IslandView.Point(_player.Position);
+        bool build=_input.Held(GameAction.Build) && SelectedItem.HasValue;
+        bool remove=_input.Held(GameAction.Remove);
+        bool initialRemove=_input.ConsumePress(GameAction.Remove);
+        _repeat-=delta;
+        if(!build && !remove) { _lastCell=null; _repeat=0; }
+        if((build || remove) && (_repeat<=0 || _lastCell!=cell))
         {
-            _buildLayer =
-                _buildLayer == BuildLayer.Solid
-                    ? BuildLayer.Background
-                    : BuildLayer.Solid;
-
-            _lastPlaceAttempt = null;
-
-            SelectionChanged?.Invoke(
-                _selectedItem,
-                _buildLayer);
-
-            StatusMessage?.Invoke(
-                $"Build layer: {_buildLayer}.");
-        }
-
-        _layerKeyWasDown = layerDown;
-
-        if (_leftMouseHeld)
-        {
-            TryPlaceSelected();
-        }
-
-        if (_rightMouseHeld)
-        {
-            TryDeconstructAtMouse();
-        }
-
-        UpdatePreview();
-    }
-
-    public override void _UnhandledInput(InputEvent @event)
-    {
-        if (@event is not InputEventMouseButton mouse)
-        {
-            return;
-        }
-
-        if (mouse.ButtonIndex == MouseButton.Left)
-        {
-            _leftMouseHeld = mouse.Pressed;
-
-            if (mouse.Pressed)
+            _lastCell=cell; _repeat=0.12;
+            if(remove)
             {
-                _lastPlaceAttempt = null;
-                TryPlaceSelected();
-            }
-            else
-            {
-                _lastPlaceAttempt = null;
-            }
-
-            GetViewport().SetInputAsHandled();
-            return;
-        }
-
-        if (mouse.ButtonIndex == MouseButton.Right)
-        {
-            _rightMouseHeld = mouse.Pressed;
-
-            if (mouse.Pressed)
-            {
-                _lastRemoveAttempt = null;
-
-                if (!TryDeconstructAtMouse())
+                var placed=_island.FindPlacedObjectAt(cell.CellX,cell.LogicalLevel);
+                if(placed is not null)
                 {
-                    ClearSelection();
+                    if(WorldActions.TryRemove(_island.Queries,_inventory,actor,placed.PlacementId,out var reason))
+                    { _island.RefreshPlacedCollision(); Changed?.Invoke(); _lastMessage=""; }
+                    else Message(reason);
                 }
+                else if(initialRemove) ClearSelection();
             }
-            else
+            else if(SelectedItem.HasValue)
             {
-                _lastRemoveAttempt = null;
+                if(WorldActions.TryPlace(_island.Queries,_inventory,actor,SelectedItem.Value,cell,Layer,out _,out var reason))
+                {
+                    _island.RefreshPlacedCollision(); Changed?.Invoke(); _lastMessage="";
+                    if(!_inventory.Has(SelectedItem.Value)) ClearSelection();
+                }
+                else Message(reason);
             }
-
-            GetViewport().SetInputAsHandled();
         }
+        if(SelectedItem.HasValue && _island.Queries.InBounds(cell))
+        {
+            bool valid=_inventory.Has(SelectedItem.Value) && _island.Queries.InReach(actor,WorldGrid.Center(cell.CellX,cell.LogicalLevel),WorldActions.BuildRange)
+                && _island.Queries.CanPlace(SelectedItem.Value,cell,Layer,WorldGrid.BearRect(actor),out _);
+            _island.SetBuildPreview(SelectedItem,cell.CellX,cell.LogicalLevel,Layer,valid);
+        }
+        else _island.ClearBuildPreview();
     }
-
-    private void TryPlaceSelected()
-    {
-        if (_selectedItem is null
-            || _player is null
-            || _island is null
-            || _inventory is null)
-        {
-            return;
-        }
-
-        ItemType item =
-            _selectedItem.Value;
-
-        if (_inventory.Get(item) <= 0)
-        {
-            ClearSelection();
-            return;
-        }
-
-        Vector2 worldMouse =
-            GetGlobalMousePosition();
-
-        if (!_island.TryWorldToBuildCell(
-            worldMouse,
-            out int cellX,
-            out int logicalLevel))
-        {
-            return;
-        }
-
-        BuildLayer effectiveLayer =
-            PlacementRules.UsesBuildLayer(item)
-                ? _buildLayer
-                : BuildLayer.Solid;
-
-        var pointerCell =
-            new BuildPointerCell(
-                cellX,
-                logicalLevel,
-                item,
-                effectiveLayer);
-
-        if (_lastPlaceAttempt == pointerCell)
-        {
-            return;
-        }
-
-        _lastPlaceAttempt = pointerCell;
-
-        Vector2 center =
-            _island.GetBuildCellCenter(
-                cellX,
-                logicalLevel);
-
-        if (_player.Position.DistanceTo(center)
-            > MaximumBuildDistance)
-        {
-            return;
-        }
-
-        if (!_island.CanPlaceObject(
-            item,
-            cellX,
-            logicalLevel,
-            effectiveLayer,
-            GetPlayerRect(),
-            out _))
-        {
-            return;
-        }
-
-        _island.AddPlacedObject(
-            item,
-            cellX,
-            logicalLevel,
-            effectiveLayer);
-
-        _inventory.Add(item, -1);
-
-        InventoryChanged?.Invoke();
-        IslandChanged?.Invoke();
-
-        if (_inventory.Get(item) <= 0)
-        {
-            ClearSelection();
-        }
-    }
-
-    private bool TryDeconstructAtMouse()
-    {
-        if (_player is null
-            || _island is null
-            || _inventory is null)
-        {
-            return false;
-        }
-
-        Vector2 worldMouse =
-            GetGlobalMousePosition();
-
-        if (!_island.TryWorldToBuildCell(
-            worldMouse,
-            out int cellX,
-            out int logicalLevel))
-        {
-            return false;
-        }
-
-        var pointerCell =
-            new CellPointer(
-                cellX,
-                logicalLevel);
-
-        if (_lastRemoveAttempt == pointerCell)
-        {
-            return true;
-        }
-
-        _lastRemoveAttempt = pointerCell;
-
-        Vector2 center =
-            _island.GetBuildCellCenter(
-                cellX,
-                logicalLevel);
-
-        if (_player.Position.DistanceTo(center)
-            > MaximumBuildDistance)
-        {
-            return true;
-        }
-
-        PlacedObjectState? placed =
-            _island.FindPlacedObjectAt(
-                cellX,
-                logicalLevel);
-
-        if (placed is null)
-        {
-            return false;
-        }
-
-        if (placed.Item == ItemType.Beehive
-            && placed.StoredOutput > 0)
-        {
-            _inventory.Add(
-                ItemType.Honey,
-                placed.StoredOutput);
-        }
-
-        if (!_island.RemovePlacedObject(
-            placed.PlacementId,
-            out ItemType returnedItem))
-        {
-            return false;
-        }
-
-        _inventory.Add(
-            returnedItem,
-            1);
-
-        InventoryChanged?.Invoke();
-        IslandChanged?.Invoke();
-        return true;
-    }
-
-    private void UpdatePreview()
-    {
-        if (_selectedItem is null
-            || _player is null
-            || _island is null)
-        {
-            _island?.ClearBuildPreview();
-            return;
-        }
-
-        Vector2 worldMouse =
-            GetGlobalMousePosition();
-
-        if (!_island.TryWorldToBuildCell(
-            worldMouse,
-            out int cellX,
-            out int logicalLevel))
-        {
-            _island.ClearBuildPreview();
-            return;
-        }
-
-        ItemType item =
-            _selectedItem.Value;
-
-        BuildLayer effectiveLayer =
-            PlacementRules.UsesBuildLayer(item)
-                ? _buildLayer
-                : BuildLayer.Solid;
-
-        bool inRange =
-            _player.Position.DistanceTo(
-                _island.GetBuildCellCenter(
-                    cellX,
-                    logicalLevel))
-            <= MaximumBuildDistance;
-
-        bool valid =
-            inRange
-            && _island.CanPlaceObject(
-                item,
-                cellX,
-                logicalLevel,
-                effectiveLayer,
-                GetPlayerRect(),
-                out _);
-
-        _island.SetBuildPreview(
-            item,
-            cellX,
-            logicalLevel,
-            effectiveLayer,
-            valid);
-    }
-
-    private Rect2 GetPlayerRect()
-    {
-        if (_player is null)
-        {
-            return default;
-        }
-
-        return new Rect2(
-            _player.Position
-                - new Vector2(
-                    17.0f,
-                    29.0f),
-            new Vector2(
-                34.0f,
-                58.0f));
-    }
-
-    private readonly record struct CellPointer(
-        int CellX,
-        int LogicalLevel);
-
-    private readonly record struct BuildPointerCell(
-        int CellX,
-        int LogicalLevel,
-        ItemType Item,
-        BuildLayer Layer);
+    private void Message(string text) { if(_lastMessage==text) return; _lastMessage=text; StatusMessage?.Invoke(text); }
 }

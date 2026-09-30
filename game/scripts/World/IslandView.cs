@@ -2,3311 +2,591 @@ using BearAdventure.Domain.Gameplay;
 using BearAdventure.Domain.Simulation;
 using BearAdventure.Domain.World;
 using BearAdventure.Rendering;
+using BearAdventure.Rendering.PixelArt;
 using Godot;
 
 namespace BearAdventure.World;
 
+/// <summary>Godot projection only. Rule decisions and persistent mutations live in the domain.</summary>
 public partial class IslandView : Node2D
 {
-    public const float CellSize = 48.0f;
-    public const int WaterMarginCells = 7;
-    public const int BoatConstructionShoreCells = 2;
-
+    public const float CellSize = (float)WorldGrid.CellSize;
+    public const int WaterMarginCells = WorldGrid.WaterMarginCells;
+    public const int BoatConstructionShoreCells = WorldGrid.ShoreCells;
     private readonly IslandDefinition _island;
     private readonly IslandDeltaState _state;
     private readonly BiomePalette _palette;
-
-    private int? _highlightedFeatureId;
-    private float _highlightedFeatureProgress;
-    private int? _highlightedPlacementId;
-    private float _highlightedPlacementProgress;
-
-    private StaticBody2D? _terrainCollisionBody;
-    private StaticBody2D? _placedCollisionBody;
-    private StaticBody2D? _boatCollisionBody;
-
+    private readonly IReadOnlyList<ResidentState> _residents;
+    private int? _highlightedFeatureId, _highlightedPlacementId;
+    private float _highlightedFeatureProgress, _highlightedPlacementProgress;
     private UndergroundCell? _highlightedMineCell;
     private float _highlightedMineProgress;
-
     private ItemType? _previewItem;
-    private int _previewCellX;
-    private int _previewLogicalLevel;
+    private int _previewCellX, _previewLogicalLevel;
     private BuildLayer _previewLayer;
     private bool _previewValid;
-
-    public IslandView(
-        IslandDefinition island,
-        IslandDeltaState state)
-    {
-        _island =
-            island
-            ?? throw new ArgumentNullException(nameof(island));
-        _state =
-            state
-            ?? throw new ArgumentNullException(nameof(state));
-        _palette = BiomePalette.For(island.Biome);
-    }
-
+    private Rect2? _entityHighlight;
+    private int? _residentHighlight;
+    private StaticBody2D? _terrainCollisionBody, _placedCollisionBody, _boatCollisionBody, _structureCollisionBody;
+    private readonly Dictionary<int,List<CollisionShape2D>> _rows=new();
+    private readonly Dictionary<int,CollisionShape2D> _placedShapes=new();
+    public WorldQueries Queries {get;}
     public IslandDefinition Definition => _island;
-
     public IslandDeltaState State => _state;
-
-    public float LandLeftX => WaterMarginCells * CellSize;
-
-    public float LandRightX =>
-        LandLeftX + _island.WidthCells * CellSize;
-
-    public float WorldWidth =>
-        LandRightX + WaterMarginCells * CellSize;
-
-    public float WorldTop =>
-        -IslandGenerationSettings.HighestLogicalLevel * CellSize;
-
-    public float WorldBottom =>
-        -IslandGenerationSettings.DeepestLogicalLevel * CellSize;
-
+    public float LandLeftX => (float)WorldGrid.LandLeft;
+    public float LandRightX => LandLeftX+_island.WidthCells*CellSize;
+    public float WorldWidth => LandRightX+WaterMarginCells*CellSize;
+    public float WorldTop => -IslandGenerationSettings.HighestLogicalLevel*CellSize;
+    public float WorldBottom => -IslandGenerationSettings.DeepestLogicalLevel*CellSize;
     public Color SkyColor => _palette.Sky;
-
-    public int RemainingNaturalFeatureCount =>
-        _island.NaturalFeatures.Count(
-            feature =>
-                !_state.IsNaturalFeatureHarvested(
-                    feature.FeatureId));
-
-    public override void _Ready()
+    public int RemainingNaturalFeatureCount => _island.NaturalFeatures.Count(Queries.NaturalPresent);
+    public IslandView(IslandDefinition definition, IslandDeltaState state, IReadOnlyList<ResidentState>? residents=null)
     {
-        _terrainCollisionBody =
-            new StaticBody2D
-            {
-                Name = "TerrainCollision",
-            };
-        AddChild(_terrainCollisionBody);
-        RebuildTerrainCollision();
-
-        _placedCollisionBody =
-            new StaticBody2D
-            {
-                Name = "PlayerBuiltCollision",
-            };
-        AddChild(_placedCollisionBody);
-        RebuildPlacedCollision();
-
-        _boatCollisionBody =
-            new StaticBody2D
-            {
-                Name = "BoatCollision",
-                CollisionLayer = 1,
-                CollisionMask = 1,
-            };
-        AddChild(_boatCollisionBody);
-        RebuildBoatCollision();
-
-        ZIndex = -10;
-        QueueRedraw();
+        _island=definition; _state=state; _residents=residents ?? Array.Empty<ResidentState>();
+        _palette=BiomePalette.For(definition.Biome); Queries=new(definition,state);
+        ProcessMode=ProcessModeEnum.Pausable; ZIndex=-10;
     }
-
-    public Vector2 GetSuggestedSpawnPosition()
-    {
-        int cellX = _island.SuggestedSpawnCell;
-        float x =
-            LandLeftX + (cellX + 0.5f) * CellSize;
-        float surfaceY =
-            LevelToWorldY(
-                _island.SurfaceLevels[cellX]);
-
-        return new Vector2(
-            x,
-            surfaceY - 31.0f);
-    }
-
-    public Vector2 GetBoatArrivalSpawn(BoatSide side)
-    {
-        int cellX =
-            side == BoatSide.Left
-                ? BoatConstructionShoreCells + 1
-                : _island.WidthCells
-                    - BoatConstructionShoreCells
-                    - 2;
-
-        cellX =
-            Math.Clamp(
-                cellX,
-                0,
-                _island.WidthCells - 1);
-
-        float x =
-            LandLeftX
-            + (cellX + 0.5f) * CellSize;
-
-        float surfaceY =
-            LevelToWorldY(
-                _island.SurfaceLevels[cellX]);
-
-        return new Vector2(
-            x,
-            surfaceY - 31.0f);
-    }
-
-    public BoatSide? FindNearbyBoatSite(
-        Vector2 worldPosition,
-        float maximumDistance)
-    {
-        float maximumDistanceSquared =
-            maximumDistance * maximumDistance;
-
-        foreach (BoatSide side in Enum.GetValues<BoatSide>())
-        {
-            Vector2 center =
-                GetBoatSiteCenter(side);
-
-            if (worldPosition.DistanceSquaredTo(center)
-                <= maximumDistanceSquared)
-            {
-                return side;
-            }
-        }
-
-        return null;
-    }
-
-    public bool IsBoatBuilt(BoatSide side)
-    {
-        return _state.IsBoatBuilt(side);
-    }
-
-    public bool BuildBoat(BoatSide side)
-    {
-        bool built =
-            _state.BuildBoat(side);
-
-        if (built)
-        {
-            RebuildBoatCollision();
-            QueueRedraw();
-        }
-
-        return built;
-    }
-
+    public override void _Ready() { PreparePhysics(); TextureFilter=TextureFilterEnum.Nearest; QueueRedraw(); }
+    public static WorldPoint Point(Vector2 value) => new(value.X,value.Y);
+    public static Vector2 Vector(WorldPoint value) => new((float)value.X,(float)value.Y);
+    public static Rect2 Rect(WorldRect value) => new((float)value.X,(float)value.Y,(float)value.Width,(float)value.Height);
+    public float LevelToWorldY(int level) => -level*CellSize;
+    public Vector2 GetSuggestedSpawnPosition() => Vector(Queries.SafeSpawn());
+    public Vector2 GetBoatArrivalSpawn(BoatSide side) => Vector(Queries.SafeSpawn(side));
+    public Vector2 GetFeatureWorldPosition(NaturalFeatureSpawn f) => Vector(WorldGrid.Feet(f.CellX,f.SurfaceLevel));
+    public Rect2 GetBuildCellRect(int x,int level) => Rect(WorldGrid.CellRect(new(x,level)));
+    public Vector2 GetBuildCellCenter(int x,int level) => Vector(WorldGrid.Center(x,level));
+    private Rect2 GetTerrainCellRect(int x,int level) => GetBuildCellRect(x,level);
+    private bool IsSolidTerrainCell(UndergroundCell cell) => Queries.TerrainSolid(cell);
+    private bool IsMineCellExposed(UndergroundCell cell) => Queries.Exposed(cell);
+    public bool IsInMineShaft(Vector2 center) => Queries.IsLadder(Point(center));
+    private Vector2 GetBoatWaterCenter(BoatSide side) => Vector(WorldGrid.BoatCenter(_island.WidthCells,side));
     public Vector2 GetBoatSiteCenter(BoatSide side)
+    { int x=side==BoatSide.Left?0:_island.WidthCells-1; return Vector(WorldGrid.Feet(x,_island.SurfaceLevels[x])); }
+    public bool TryWorldToBuildCell(Vector2 mouse,out int x,out int level)
+    { var cell=WorldGrid.CellAt(Point(mouse)); x=cell.CellX; level=cell.LogicalLevel; return Queries.InBounds(cell); }
+    public bool IsBoatBuilt(BoatSide side) => _state.IsBoatBuilt(side);
+    public PlacedObjectState? FindPlacedObjectAt(int x,int level) => _state.PlacedObjects
+        .Where(p=>p.CellX==x && p.LogicalLevel==level).OrderBy(p=>p.Layer==BuildLayer.Background?1:0).FirstOrDefault();
+    public void ClearIndicators()
     {
-        int cellX =
-            side == BoatSide.Left
-                ? 0
-                : _island.WidthCells - 1;
-
-        float x =
-            LandLeftX
-            + (cellX + 0.5f) * CellSize;
-
-        float y =
-            LevelToWorldY(
-                _island.SurfaceLevels[cellX]);
-
-        return new Vector2(x, y);
+        _highlightedFeatureId=null; _highlightedPlacementId=null; _highlightedMineCell=null; _entityHighlight=null; _residentHighlight=null;
+        _highlightedFeatureProgress=0; _highlightedPlacementProgress=0; _highlightedMineProgress=0; QueueRedraw();
     }
-
-    private Vector2 GetBoatWaterCenter(
-        BoatSide side)
+    public void SetHarvestIndicator(int? id,float progress) { _highlightedFeatureId=id; _highlightedFeatureProgress=progress; QueueRedraw(); }
+    public void SetPlacedHarvestIndicator(int? id,float progress) { _highlightedPlacementId=id; _highlightedPlacementProgress=progress; QueueRedraw(); }
+    public void SetMineIndicator(UndergroundCell? cell,float progress) { _highlightedMineCell=cell; _highlightedMineProgress=progress; QueueRedraw(); }
+    public void SetEntityIndicator(WorldEntityRef? entity)
     {
-        float waterOffset =
-            CellSize * 0.88f;
-
-        float x =
-            side == BoatSide.Left
-                ? LandLeftX - waterOffset
-                : LandRightX + waterOffset;
-
-        return new Vector2(
-            x,
-            4.0f);
-    }
-
-    public float LevelToWorldY(int logicalLevel)
-    {
-        return -logicalLevel * CellSize;
-    }
-
-    public Vector2 GetFeatureWorldPosition(
-        NaturalFeatureSpawn feature)
-    {
-        return new Vector2(
-            LandLeftX
-                + (feature.CellX + 0.5f) * CellSize,
-            LevelToWorldY(feature.SurfaceLevel));
-    }
-
-    public NaturalFeatureSpawn? FindNearestHarvestable(
-        Vector2 worldPosition,
-        float maximumDistance)
-    {
-        NaturalFeatureSpawn? nearest = null;
-        float bestDistanceSquared =
-            maximumDistance * maximumDistance;
-
-        foreach (NaturalFeatureSpawn feature
-                 in _island.NaturalFeatures)
-        {
-            if (_state.IsNaturalFeatureHarvested(
-                feature.FeatureId))
-            {
-                continue;
-            }
-
-            Vector2 featurePosition =
-                GetFeatureWorldPosition(feature);
-
-            float distanceSquared =
-                worldPosition.DistanceSquaredTo(
-                    featurePosition);
-
-            if (distanceSquared <= bestDistanceSquared)
-            {
-                nearest = feature;
-                bestDistanceSquared = distanceSquared;
-            }
-        }
-
-        return nearest;
-    }
-
-    public PlacedObjectState? FindNearestPlacedHarvestable(
-        Vector2 worldPosition,
-        float maximumDistance)
-    {
-        PlacedObjectState? nearest = null;
-        float bestDistanceSquared =
-            maximumDistance * maximumDistance;
-
-        foreach (PlacedObjectState placed
-                 in _state.PlacedObjects)
-        {
-            if (!PlacedHarvestRules.IsHarvestable(placed))
-            {
-                continue;
-            }
-
-            Vector2 center =
-                GetBuildCellCenter(
-                    placed.CellX,
-                    placed.LogicalLevel);
-
-            float distanceSquared =
-                worldPosition.DistanceSquaredTo(center);
-
-            if (distanceSquared <= bestDistanceSquared)
-            {
-                nearest = placed;
-                bestDistanceSquared =
-                    distanceSquared;
-            }
-        }
-
-        return nearest;
-    }
-
-    public PlacedObjectState? FindNearestInteractive(
-        Vector2 worldPosition,
-        float maximumDistance)
-    {
-        PlacedObjectState? nearest = null;
-        float bestDistanceSquared =
-            maximumDistance * maximumDistance;
-
-        foreach (PlacedObjectState placed
-                 in _state.PlacedObjects)
-        {
-            if (placed.Item is not (
-                ItemType.Beehive
-                or ItemType.Forge
-                or ItemType.Anvil
-                or ItemType.Cauldron))
-            {
-                continue;
-            }
-
-            Vector2 center =
-                GetBuildCellCenter(
-                    placed.CellX,
-                    placed.LogicalLevel);
-
-            float distanceSquared =
-                worldPosition.DistanceSquaredTo(
-                    center);
-
-            if (distanceSquared <= bestDistanceSquared)
-            {
-                nearest = placed;
-                bestDistanceSquared =
-                    distanceSquared;
-            }
-        }
-
-        return nearest;
-    }
-
-    public int CollectHiveHoney(int placementId)
-    {
-        PlacedObjectState? hive =
-            _state.PlacedObjects.FirstOrDefault(
-                placed =>
-                    placed.PlacementId == placementId
-                    && placed.Item == ItemType.Beehive);
-
-        if (hive is null
-            || hive.StoredOutput <= 0)
-        {
-            return 0;
-        }
-
-        int collected =
-            hive.StoredOutput;
-
-        hive.StoredOutput = 0;
+        _entityHighlight=null;
+        if(entity.HasValue && Queries.TryEntity(entity.Value,out var placed,out var chest,out _))
+            _entityHighlight=placed is not null?GetBuildCellRect(placed.CellX,placed.LogicalLevel):GetBuildCellRect(chest!.CellX,chest.LogicalLevel);
         QueueRedraw();
-        return collected;
     }
+    public void SetResidentIndicator(int? residentId) { _residentHighlight=residentId; QueueRedraw(); }
+    public void SetBuildPreview(ItemType? item,int x,int level,BuildLayer layer,bool valid)
+    { _previewItem=item; _previewCellX=x; _previewLogicalLevel=level; _previewLayer=layer; _previewValid=valid; QueueRedraw(); }
+    public void ClearBuildPreview() { _previewItem=null; QueueRedraw(); }
 
-    public bool TryHarvestFeature(
-        int featureId,
-        out NaturalFeatureSpawn harvestedFeature)
+    /// <summary>May run off-tree to stage a destination before touching the origin island.</summary>
+    public void PreparePhysics()
     {
-        foreach (NaturalFeatureSpawn feature
-                 in _island.NaturalFeatures)
-        {
-            if (feature.FeatureId != featureId)
-            {
-                continue;
-            }
-
-            if (_state.IsNaturalFeatureHarvested(featureId))
-            {
-                break;
-            }
-
-            if (!_state.MarkNaturalFeatureHarvested(
-                featureId,
-                NaturalRegrowthRules.GetRegrowSeconds(
-                    feature.Kind)))
-            {
-                break;
-            }
-
-            harvestedFeature = feature;
-            _highlightedFeatureId = null;
-            _highlightedFeatureProgress = 0.0f;
-            QueueRedraw();
-            return true;
-        }
-
-        harvestedFeature = default;
-        return false;
+        if(_terrainCollisionBody is not null) return;
+        _terrainCollisionBody=new StaticBody2D {Name="TerrainCollision",CollisionLayer=1,CollisionMask=1}; AddChild(_terrainCollisionBody);
+        _placedCollisionBody=new StaticBody2D {Name="PlayerBuiltCollision",CollisionLayer=1,CollisionMask=1}; AddChild(_placedCollisionBody);
+        _boatCollisionBody=new StaticBody2D {Name="BoatCollision",CollisionLayer=1,CollisionMask=1}; AddChild(_boatCollisionBody);
+        _structureCollisionBody=new StaticBody2D {Name="GeneratedStructureCollision",CollisionLayer=1,CollisionMask=1}; AddChild(_structureCollisionBody);
+        for(int level=IslandGenerationSettings.DeepestLogicalLevel;level<=_island.SurfaceLevels.Max();level++) RefreshTerrainRow(level);
+        // This foundation is outside the 201 editable rows; mining the lowest row cannot create an endless fall.
+        AddShape(_terrainCollisionBody,new WorldRect(LandLeftX,WorldBottom+CellSize,_island.WidthCells*CellSize,CellSize));
+        RefreshPlacedCollision(); RefreshBoatCollision(); RefreshStructureCollision();
     }
-
-    public bool TryHarvestPlacedObject(
-        int placementId,
-        out PlacedObjectState harvested)
+    public void RefreshTerrainRow(int level)
     {
-        PlacedObjectState? placed =
-            _state.PlacedObjects.FirstOrDefault(
-                item =>
-                    item.PlacementId == placementId);
-
-        if (placed is null
-            || !PlacedHarvestRules.IsHarvestable(placed))
+        if(_terrainCollisionBody is null) return;
+        if(_rows.Remove(level,out var old)) foreach(var shape in old) { _terrainCollisionBody.RemoveChild(shape); shape.QueueFree(); }
+        var shapes=new List<CollisionShape2D>(); int start=-1;
+        for(int x=0;x<=_island.WidthCells;x++)
         {
-            harvested = null!;
-            return false;
+            bool solid=x<_island.WidthCells && Queries.TerrainSolid(new(x,level));
+            if(solid && start<0) start=x;
+            if(!solid && start>=0)
+            {
+                shapes.Add(AddShape(_terrainCollisionBody,new WorldRect(LandLeftX+start*CellSize,LevelToWorldY(level),(x-start)*CellSize,CellSize)));
+                start=-1;
+            }
         }
-
-        harvested = placed;
-
-        if (!_state.RemovePlacedObject(placementId))
-        {
-            harvested = null!;
-            return false;
-        }
-
-        _highlightedPlacementId = null;
-        _highlightedPlacementProgress = 0.0f;
-
-        RebuildPlacedCollision();
+        _rows[level]=shapes; QueueRedraw();
+    }
+    public void RefreshPlacedCollision()
+    {
+        if(_placedCollisionBody is null) return;
+        var solid=_state.PlacedObjects.Where(p=>PlacementRules.IsSolid(p.Item,p.Layer)).ToDictionary(p=>p.PlacementId);
+        foreach(var id in _placedShapes.Keys.Where(id=>!solid.ContainsKey(id)).ToArray())
+        { var shape=_placedShapes[id]; _placedCollisionBody.RemoveChild(shape); shape.QueueFree(); _placedShapes.Remove(id); }
+        foreach(var (id,p) in solid)
+            if(!_placedShapes.ContainsKey(id)) _placedShapes[id]=AddShape(_placedCollisionBody,WorldGrid.CellRect(new(p.CellX,p.LogicalLevel)));
         QueueRedraw();
-        return true;
+    }
+    public void RefreshStructureCollision()
+    {
+        if(_structureCollisionBody is null) return;
+        foreach(Node node in _structureCollisionBody.GetChildren())
+        { _structureCollisionBody.RemoveChild(node); node.QueueFree(); }
+
+        foreach(var layout in Queries.StructureLayouts)
+        {
+            foreach(var group in layout.SolidCells.GroupBy(c=>c.LogicalLevel))
+            {
+                int start=-1,previous=-2;
+                foreach(int x in group.Select(c=>c.CellX).OrderBy(x=>x).Append(int.MaxValue))
+                {
+                    if(start<0) { if(x!=int.MaxValue) { start=x; previous=x; } continue; }
+                    if(x==previous+1) { previous=x; continue; }
+                    AddShape(_structureCollisionBody,new WorldRect(
+                        LandLeftX+start*CellSize,LevelToWorldY(group.Key),
+                        (previous-start+1)*CellSize,CellSize));
+                    if(x==int.MaxValue) break;
+                    start=x; previous=x;
+                }
+            }
+        }
+        QueueRedraw();
     }
 
-    public void SetPlacedHarvestIndicator(
-        int? placementId,
-        float progress)
+    public void RefreshBoatCollision(BoatSide? pendingArrival=null)
     {
-        progress =
-            Mathf.Clamp(
-                progress,
-                0.0f,
-                1.0f);
+        if(_boatCollisionBody is null) return;
+        foreach(Node node in _boatCollisionBody.GetChildren()) { _boatCollisionBody.RemoveChild(node); node.QueueFree(); }
+        foreach(var side in Enum.GetValues<BoatSide>()) if(_state.IsBoatBuilt(side) || pendingArrival==side) AddShape(_boatCollisionBody,WorldGrid.BoatHull(_island.WidthCells,side));
+        QueueRedraw();
+    }
+    private static CollisionShape2D AddShape(Node parent, WorldRect r)
+    {
+        var shape=new CollisionShape2D {Shape=new RectangleShape2D {Size=new((float)r.Width,(float)r.Height)},Position=Vector(r.Center)};
+        parent.AddChild(shape); return shape;
+    }
 
-        bool changed =
-            _highlightedPlacementId != placementId
-            || !Mathf.IsEqualApprox(
-                _highlightedPlacementProgress,
-                progress);
+    #region Procedural pixel presentation (read-only)
 
-        _highlightedPlacementId =
-            placementId;
-        _highlightedPlacementProgress =
-            progress;
+    private double _artClock;
+    private int _artFrame;
+    private Transform2D _lastArtTransform;
+    private Rect2 _artView;
 
-        if (changed)
+    public override void _Process(double delta)
+    {
+        _artClock += delta;
+        int frame = (int)(_artClock * 8.0) % 4;
+        Transform2D transform = GetCanvasTransform();
+        if (frame != _artFrame || transform != _lastArtTransform)
         {
+            _artFrame = frame;
+            _lastArtTransform = transform;
             QueueRedraw();
         }
-    }
-
-    public void SetHarvestIndicator(
-        int? featureId,
-        float progress)
-    {
-        progress = Mathf.Clamp(progress, 0.0f, 1.0f);
-
-        bool changed =
-            _highlightedFeatureId != featureId
-            || !Mathf.IsEqualApprox(
-                _highlightedFeatureProgress,
-                progress);
-
-        _highlightedFeatureId = featureId;
-        _highlightedFeatureProgress = progress;
-
-        if (changed)
-        {
-            QueueRedraw();
-        }
-    }
-
-
-    public bool IsInMineShaft(
-        Vector2 worldPosition)
-    {
-        int shaftRight =
-            _island.MineShaftLeftCell
-            + _island.MineShaftWidthCells;
-
-        float left =
-            LandLeftX
-            + _island.MineShaftLeftCell
-                * CellSize;
-
-        float right =
-            LandLeftX
-            + shaftRight
-                * CellSize;
-
-        int highestSurface =
-            Enumerable
-                .Range(
-                    _island.MineShaftLeftCell,
-                    _island.MineShaftWidthCells)
-                .Select(
-                    x =>
-                        _island.SurfaceLevels[x])
-                .Max();
-
-        float top =
-            LevelToWorldY(
-                highestSurface)
-            - CellSize;
-
-        float bottom =
-            WorldBottom
-            + CellSize;
-
-        return worldPosition.X
-                >= left - 8.0f
-            && worldPosition.X
-                <= right + 8.0f
-            && worldPosition.Y
-                >= top
-            && worldPosition.Y
-                <= bottom;
-    }
-
-    public UndergroundCell? FindHoveredMineableCell(
-        Vector2 mouseWorldPosition,
-        Vector2 playerWorldPosition,
-        float maximumDistance)
-    {
-        if (!TryWorldToTerrainCell(
-            mouseWorldPosition,
-            out int cellX,
-            out int logicalLevel))
-        {
-            return null;
-        }
-
-        var cell =
-            new UndergroundCell(
-                cellX,
-                logicalLevel);
-
-        if (!IsSolidTerrainCell(cell)
-            || !IsMineCellExposed(cell))
-        {
-            return null;
-        }
-
-        Vector2 center =
-            GetUndergroundCellCenter(
-                cell);
-
-        if (playerWorldPosition.DistanceSquaredTo(center)
-            > maximumDistance * maximumDistance)
-        {
-            return null;
-        }
-
-        return cell;
-    }
-
-    public Vector2 GetUndergroundCellCenter(
-        UndergroundCell cell)
-    {
-        return GetTerrainCellRect(
-            cell.CellX,
-            cell.LogicalLevel)
-            .GetCenter();
-    }
-
-    public bool TryMineUndergroundCell(
-        UndergroundCell cell,
-        out UndergroundOreSpawn? ore)
-    {
-        ore = null;
-
-        if (!IsSolidTerrainCell(cell)
-            || !IsMineCellExposed(cell)
-            || !_state.MarkUndergroundCellMined(
-                cell))
-        {
-            return false;
-        }
-
-        if (_island.UndergroundOres.TryGetValue(
-            cell,
-            out UndergroundOreSpawn foundOre))
-        {
-            ore =
-                foundOre;
-        }
-
-        _highlightedMineCell = null;
-        _highlightedMineProgress = 0.0f;
-
-        RebuildTerrainCollision();
-        QueueRedraw();
-        return true;
-    }
-
-    public void SetMineIndicator(
-        UndergroundCell? cell,
-        float progress)
-    {
-        progress =
-            Mathf.Clamp(
-                progress,
-                0.0f,
-                1.0f);
-
-        bool changed =
-            _highlightedMineCell != cell
-            || !Mathf.IsEqualApprox(
-                _highlightedMineProgress,
-                progress);
-
-        _highlightedMineCell =
-            cell;
-
-        _highlightedMineProgress =
-            progress;
-
-        if (changed)
-        {
-            QueueRedraw();
-        }
-    }
-
-    public GeneratedChestDefinition? FindNearestGeneratedChest(
-        Vector2 worldPosition,
-        float maximumDistance)
-    {
-        GeneratedChestDefinition? nearest =
-            null;
-
-        float bestDistanceSquared =
-            maximumDistance
-            * maximumDistance;
-
-        foreach (GeneratedStructureDefinition structure
-                 in _island.GeneratedStructures)
-        {
-            GeneratedChestDefinition chest =
-                structure.Chest;
-
-            Vector2 center =
-                GetBuildCellCenter(
-                    chest.CellX,
-                    chest.LogicalLevel);
-
-            float distanceSquared =
-                worldPosition
-                    .DistanceSquaredTo(
-                        center);
-
-            if (distanceSquared
-                <= bestDistanceSquared)
-            {
-                nearest =
-                    chest;
-
-                bestDistanceSquared =
-                    distanceSquared;
-            }
-        }
-
-        return nearest;
-    }
-
-    public bool IsGeneratedChestLooted(
-        int chestId)
-    {
-        return _state
-            .IsGeneratedChestLooted(
-                chestId);
-    }
-
-    public bool TryLootGeneratedChest(
-        int chestId,
-        out IReadOnlyList<HarvestReward> rewards)
-    {
-        GeneratedChestDefinition? chest =
-            _island.GeneratedStructures
-                .Select(
-                    structure =>
-                        structure.Chest)
-                .FirstOrDefault(
-                    item =>
-                        item.ChestId
-                        == chestId);
-
-        if (chest is null
-            || _state.IsGeneratedChestLooted(
-                chestId)
-            || !_state.MarkGeneratedChestLooted(
-                chestId))
-        {
-            rewards =
-                Array.Empty<HarvestReward>();
-            return false;
-        }
-
-        rewards =
-            chest.Loot
-                .Select(
-                    pair =>
-                        new HarvestReward(
-                            pair.Key,
-                            pair.Value))
-                .ToArray();
-
-        QueueRedraw();
-        return true;
-    }
-
-    public bool TryWorldToBuildCell(
-        Vector2 worldPosition,
-        out int cellX,
-        out int logicalLevel)
-    {
-        float localX =
-            worldPosition.X - LandLeftX;
-
-        cellX =
-            Mathf.FloorToInt(
-                localX / CellSize);
-
-        logicalLevel =
-            Mathf.FloorToInt(
-                -worldPosition.Y / CellSize) + 1;
-
-        return cellX >= 0
-            && cellX < _island.WidthCells
-            && logicalLevel
-                <= IslandGenerationSettings.HighestLogicalLevel
-            && logicalLevel
-                > IslandGenerationSettings.DeepestLogicalLevel;
-    }
-
-    public Rect2 GetBuildCellRect(
-        int cellX,
-        int logicalLevel)
-    {
-        return new Rect2(
-            LandLeftX + cellX * CellSize,
-            LevelToWorldY(logicalLevel),
-            CellSize,
-            CellSize);
-    }
-
-    public Vector2 GetBuildCellCenter(
-        int cellX,
-        int logicalLevel)
-    {
-        return GetBuildCellRect(
-            cellX,
-            logicalLevel).GetCenter();
-    }
-
-    public bool CanPlaceObject(
-        ItemType item,
-        int cellX,
-        int logicalLevel,
-        BuildLayer layer,
-        Rect2 playerRect,
-        out string reason)
-    {
-        reason = string.Empty;
-
-        if (!PlacementRules.IsPlaceable(item))
-        {
-            reason = "That item cannot be placed.";
-            return false;
-        }
-
-        if (cellX < 0
-            || cellX >= _island.WidthCells)
-        {
-            reason = "Build inside the island.";
-            return false;
-        }
-
-        if (cellX < BoatConstructionShoreCells
-            || cellX >= _island.WidthCells
-                - BoatConstructionShoreCells)
-        {
-            reason = "The shoreline boat spot must stay clear.";
-            return false;
-        }
-
-        if (logicalLevel
-            <= _island.SurfaceLevels[cellX])
-        {
-            reason = "That cell is inside terrain.";
-            return false;
-        }
-
-        if (logicalLevel
-            > IslandGenerationSettings.HighestLogicalLevel)
-        {
-            reason = "That cell is above the build limit.";
-            return false;
-        }
-
-        bool background =
-            PlacementRules.IsBlock(item)
-            && layer == BuildLayer.Background;
-
-        bool occupied =
-            _state.PlacedObjects.Any(
-                placed =>
-                    placed.CellX == cellX
-                    && placed.LogicalLevel == logicalLevel
-                    && (background
-                        ? placed.Layer == BuildLayer.Background
-                        : placed.Layer != BuildLayer.Background));
-
-        if (occupied)
-        {
-            reason = "That cell is already occupied.";
-            return false;
-        }
-
-        bool naturalFeatureOccupiesSurfaceCell =
-            logicalLevel
-                == _island.SurfaceLevels[cellX] + 1
-            && _island.NaturalFeatures.Any(
-                feature =>
-                    feature.CellX == cellX
-                    && !_state.IsNaturalFeatureHarvested(
-                        feature.FeatureId));
-
-        if (!background
-            && naturalFeatureOccupiesSurfaceCell)
-        {
-            reason = "Harvest the existing resource first.";
-            return false;
-        }
-
-        bool generatedChestOccupiesCell =
-            _island.GeneratedStructures.Any(
-                structure =>
-                    structure.Chest.CellX
-                        == cellX
-                    && structure.Chest.LogicalLevel
-                        == logicalLevel);
-
-        if (generatedChestOccupiesCell)
-        {
-            reason =
-                "A generated chest occupies that cell.";
-            return false;
-        }
-
-        Rect2 placementRect =
-            GetBuildCellRect(
-                cellX,
-                logicalLevel);
-
-        if (PlacementRules.IsSolid(item, layer)
-            && placementRect.Intersects(playerRect))
-        {
-            reason = "Cannot build a solid object on the bear.";
-            return false;
-        }
-
-        bool supported =
-            HasFloorSupport(
-                cellX,
-                logicalLevel);
-
-        if (PlacementRules.IsBlock(item))
-        {
-            supported = supported
-                || HasAdjacentBlockSupport(
-                    cellX,
-                    logicalLevel,
-                    layer);
-        }
-
-        if (!supported)
-        {
-            reason = "The object needs ground or a connected block.";
-            return false;
-        }
-
-        return true;
-    }
-
-    public PlacedObjectState AddPlacedObject(
-        ItemType item,
-        int cellX,
-        int logicalLevel,
-        BuildLayer layer)
-    {
-        PlacedObjectState placed =
-            _state.AddPlacedObject(
-                item,
-                cellX,
-                logicalLevel,
-                layer);
-
-        RebuildPlacedCollision();
-        QueueRedraw();
-        return placed;
-    }
-
-    public PlacedObjectState? FindPlacedObjectAt(
-        int cellX,
-        int logicalLevel)
-    {
-        PlacedObjectState? foreground =
-            _state.PlacedObjects.FirstOrDefault(
-                placed =>
-                    placed.CellX == cellX
-                    && placed.LogicalLevel == logicalLevel
-                    && placed.Layer != BuildLayer.Background);
-
-        if (foreground is not null)
-        {
-            return foreground;
-        }
-
-        return _state.PlacedObjects.FirstOrDefault(
-            placed =>
-                placed.CellX == cellX
-                && placed.LogicalLevel == logicalLevel);
-    }
-
-    public bool RemovePlacedObject(
-        int placementId,
-        out ItemType returnedItem)
-    {
-        PlacedObjectState? placed =
-            _state.PlacedObjects.FirstOrDefault(
-                item =>
-                    item.PlacementId == placementId);
-
-        if (placed is null)
-        {
-            returnedItem = default;
-            return false;
-        }
-
-        returnedItem = placed.Item;
-
-        if (!_state.RemovePlacedObject(placementId))
-        {
-            return false;
-        }
-
-        RebuildPlacedCollision();
-        QueueRedraw();
-        return true;
-    }
-
-    public void SetBuildPreview(
-        ItemType? item,
-        int cellX,
-        int logicalLevel,
-        BuildLayer layer,
-        bool valid)
-    {
-        bool changed =
-            _previewItem != item
-            || _previewCellX != cellX
-            || _previewLogicalLevel != logicalLevel
-            || _previewLayer != layer
-            || _previewValid != valid;
-
-        _previewItem = item;
-        _previewCellX = cellX;
-        _previewLogicalLevel = logicalLevel;
-        _previewLayer = layer;
-        _previewValid = valid;
-
-        if (changed)
-        {
-            QueueRedraw();
-        }
-    }
-
-    public void ClearBuildPreview()
-    {
-        if (_previewItem is null)
-        {
-            return;
-        }
-
-        _previewItem = null;
-        QueueRedraw();
     }
 
     public override void _Draw()
     {
-        DrawOcean();
-        DrawUndergroundBackdrop();
-        DrawTerrain();
-        DrawUndergroundOres();
-        DrawMineLadder();
-        DrawBoatSites();
-        DrawGeneratedStructures();
-        DrawPlacedObjects(backgroundOnly: true);
-        DrawNaturalFeatures();
-        DrawGeneratedChests();
-        DrawPlacedObjects(backgroundOnly: false);
-        DrawMineIndicator();
-        DrawBuildPreview();
+        TextureFilter = TextureFilterEnum.Nearest;
+        Transform2D inverse = GetCanvasTransform().AffineInverse();
+        Vector2 a = inverse * Vector2.Zero;
+        Vector2 b = inverse * GetViewportRect().Size;
+        _artView = new Rect2(new Vector2(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y)),
+            new Vector2(Math.Abs(b.X - a.X), Math.Abs(b.Y - a.Y))).Grow(180.0f);
+
+        DrawPixelOcean();
+        DrawPixelUnderground();
+        DrawPixelTerrain();
+        DrawPixelLadder();
+        DrawPixelStructures();
+        DrawPixelPlaced(true);
+        DrawPixelNature();
+        DrawPixelChests();
+        DrawPixelResidents();
+        DrawPixelPlaced(false);
+        DrawPixelBoats();
+        DrawPixelIndicators();
     }
 
-    private void RebuildTerrainCollision()
+    private (int Left, int Right, int Bottom, int Top) ArtCellBounds()
     {
-        if (_terrainCollisionBody is null)
-        {
-            return;
-        }
+        int left = Math.Clamp(Mathf.FloorToInt((_artView.Position.X - LandLeftX) / CellSize), 0, _island.WidthCells - 1);
+        int right = Math.Clamp(Mathf.CeilToInt((_artView.End.X - LandLeftX) / CellSize), 0, _island.WidthCells - 1);
+        int bottom = Math.Max(IslandGenerationSettings.DeepestLogicalLevel, Mathf.FloorToInt(-_artView.End.Y / CellSize) - 1);
+        int top = Math.Min(IslandGenerationSettings.HighestLogicalLevel, Mathf.CeilToInt(-_artView.Position.Y / CellSize) + 1);
+        return (left, right, bottom, top);
+    }
 
-        foreach (Node child
-                 in _terrainCollisionBody.GetChildren())
-        {
-            _terrainCollisionBody.RemoveChild(
-                child);
-            child.QueueFree();
-        }
-
-        int highestSurface =
-            _island.SurfaceLevels.Max();
-
-        for (int logicalLevel = highestSurface;
-             logicalLevel
-                >= IslandGenerationSettings.DeepestLogicalLevel;
-             logicalLevel--)
-        {
-            int runStart = -1;
-
-            for (int cellX = 0;
-                 cellX <= _island.WidthCells;
-                 cellX++)
+    private void DrawPixelUnderground()
+    {
+        var bounds = ArtCellBounds();
+        for (int x = bounds.Left; x <= bounds.Right; x++)
+            for (int level = bounds.Bottom; level <= Math.Min(0, bounds.Top); level++)
             {
-                bool solid =
-                    cellX < _island.WidthCells
-                    && IsSolidTerrainCell(
-                        new UndergroundCell(
-                            cellX,
-                            logicalLevel));
+                // The dark layer begins at exactly level 0. Above it a hole reveals sky.
+                if (IsSolidTerrainCell(new UndergroundCell(x, level))) continue;
+                PixelAtlas.DrawRect(this, $"cave/{PixelAtlas.Variant(x, level)}", GetTerrainCellRect(x, level));
+            }
+    }
 
-                if (solid
-                    && runStart < 0)
+    private void DrawPixelTerrain()
+    {
+        var bounds = ArtCellBounds();
+        for (int x = bounds.Left; x <= bounds.Right; x++)
+            for (int level = bounds.Bottom; level <= Math.Min(bounds.Top, _island.SurfaceLevels[x]); level++)
+            {
+                var cell = new UndergroundCell(x, level);
+                if (!IsSolidTerrainCell(cell)) continue;
+                Rect2 rect = GetTerrainCellRect(x, level);
+                int variant = PixelAtlas.Variant(x, level);
+                bool geologicalRock = level < Math.Min(0, _island.SurfaceLevels[x] - 3);
+                PixelAtlas.DrawRect(this, $"terrain/{_island.Biome}/{(geologicalRock ? "rock" : "soil")}/{variant}", rect);
+
+                if (!IsSolidTerrainCell(new UndergroundCell(x, level + 1)))
                 {
-                    runStart =
-                        cellX;
+                    string capBiome = geologicalRock ? "Mountain" : _island.Biome.ToString();
+                    PixelAtlas.DrawRect(this, $"cap/{capBiome}/{variant}",
+                        new Rect2(rect.Position, new Vector2(CellSize, 12.0f)));
                 }
-
-                if ((!solid
-                        || cellX
-                            == _island.WidthCells)
-                    && runStart >= 0)
+                if (!IsSolidTerrainCell(new UndergroundCell(x - 1, level)))
+                    DrawRect(new Rect2(rect.Position, new Vector2(2, CellSize)), PixelAtlas.ToColor(PxColor.Bark0));
+                if (!IsSolidTerrainCell(new UndergroundCell(x + 1, level)))
+                    DrawRect(new Rect2(rect.Position + new Vector2(CellSize - 2, 0), new Vector2(2, CellSize)), PixelAtlas.ToColor(PxColor.Stone0));
+                if (_island.UndergroundOres.TryGetValue(cell, out UndergroundOreSpawn ore) && IsMineCellExposed(cell))
                 {
-                    int runEndExclusive =
-                        cellX;
-
-                    AddTerrainCollisionRun(
-                        runStart,
-                        runEndExclusive
-                            - runStart,
-                        logicalLevel);
-
-                    runStart =
-                        -1;
+                    Color copper = PixelAtlas.ToColor(PxColor.Bark3);
+                    DrawRect(new Rect2(rect.Position + new Vector2(10, 14), new Vector2(8, 6)), copper);
+                    DrawRect(new Rect2(rect.Position + new Vector2(12, 14), new Vector2(4, 2)), PixelAtlas.ToColor(PxColor.Sand3));
+                    DrawRect(new Rect2(rect.Position + new Vector2(30, 28), new Vector2(6, 8)), copper);
+                    if (ore.Richness > 1)
+                        DrawRect(new Rect2(rect.Position + new Vector2(26, 8), new Vector2(8, 4)), copper);
                 }
+            }
+    }
+
+    private void DrawPixelOcean()
+    {
+        DrawWaterRange(0, LandLeftX);
+        DrawWaterRange(LandRightX, WorldWidth);
+    }
+
+    private void DrawWaterRange(float left, float right)
+    {
+        int start = Math.Max(0, Mathf.FloorToInt((_artView.Position.X - left) / CellSize));
+        int end = Math.Min(Mathf.CeilToInt((right - left) / CellSize), Mathf.CeilToInt((_artView.End.X - left) / CellSize));
+        for (int x = start; x < end; x++)
+        {
+            float worldX = left + x * CellSize;
+            for (int y = 0; y < 6; y++)
+            {
+                Rect2 rect = new(worldX, y * CellSize, CellSize, CellSize);
+                if (_artView.Intersects(rect))
+                    PixelAtlas.DrawRect(this, $"water/{(_artFrame + x + y) % 4}", rect);
+            }
+            if (_artView.Intersects(new Rect2(worldX, 0, CellSize, 12)))
+                PixelAtlas.DrawRect(this, $"waterline/{(_artFrame + x) % 4}", new Rect2(worldX, 0, CellSize, 12));
+        }
+    }
+
+    private void DrawPixelLadder()
+    {
+        int highestSurface = Enumerable.Range(_island.MineShaftLeftCell, _island.MineShaftWidthCells)
+            .Select(x => _island.SurfaceLevels[x]).Max();
+        float center = LandLeftX + (_island.MineShaftLeftCell + _island.MineShaftWidthCells / 2.0f) * CellSize;
+        float top = LevelToWorldY(highestSurface) - 5.0f;
+        float bottom = WorldBottom + CellSize;
+        int first = Math.Max(0, Mathf.FloorToInt((_artView.Position.Y - top) / CellSize));
+        int last = Math.Min(Mathf.CeilToInt((bottom - top) / CellSize), Mathf.CeilToInt((_artView.End.Y - top) / CellSize));
+        if (center < _artView.Position.X || center > _artView.End.X) return;
+        for (int segment = first; segment < last; segment++)
+        {
+            float y = top + segment * CellSize;
+            PixelAtlas.DrawRect(this, "ladder", new Rect2(center - 16, y, 32, Math.Min(CellSize, bottom - y)));
+        }
+    }
+
+    private void DrawPixelStructures()
+    {
+        foreach (GeneratedStructureDefinition structure in _island.GeneratedStructures)
+        {
+            GeneratedStructureLayout layout=Queries.StructureLayouts.First(l=>l.StructureId==structure.StructureId);
+            string material=structure.Kind==GeneratedStructureKind.Castle?"Stone":"Wood";
+            Color backgroundTint=structure.Kind==GeneratedStructureKind.Castle
+                ? new Color(0.58f,0.62f,0.68f,0.62f)
+                : new Color(0.62f,0.48f,0.34f,0.62f);
+
+            // Faint silhouette preserves the biome-specific architectural identity,
+            // while the grid pieces below form the actual playable cutaway.
+            float centerX=LandLeftX+(structure.CenterCellX+0.5f)*CellSize;
+            float groundY=LevelToWorldY(structure.BaseSurfaceLevel);
+            string silhouette=structure.Kind==GeneratedStructureKind.Castle?"castle":"house";
+            if(new Rect2(centerX-250,groundY-320,500,330).Intersects(_artView))
+                PixelAtlas.DrawBottom(this,$"{silhouette}/{_island.Biome}",new Vector2(centerX,groundY+2),
+                    modulate:new Color(1,1,1,0.10f));
+
+            foreach(var cell in layout.BackgroundCells)
+            {
+                Rect2 rect=GetBuildCellRect(cell.CellX,cell.LogicalLevel);
+                if(!_artView.Intersects(rect)) continue;
+                int variant=PixelAtlas.Variant(cell.CellX,cell.LogicalLevel);
+                PixelAtlas.DrawRect(this,$"block/{material}/{variant}",rect,modulate:backgroundTint);
+            }
+
+            foreach(var cell in layout.SolidCells)
+            {
+                Rect2 rect=GetBuildCellRect(cell.CellX,cell.LogicalLevel);
+                if(!_artView.Intersects(rect)) continue;
+                int variant=PixelAtlas.Variant(cell.CellX,cell.LogicalLevel);
+                PixelAtlas.DrawRect(this,$"block/{material}/{variant}",rect);
+            }
+
+            foreach(var cell in layout.LadderCells)
+            {
+                Rect2 rect=GetBuildCellRect(cell.CellX,cell.LogicalLevel);
+                if(_artView.Intersects(rect))
+                    PixelAtlas.DrawRect(this,"ladder",new Rect2(rect.GetCenter().X-16,rect.Position.Y,32,CellSize));
+            }
+
+            // Doorway edge highlights make the entrance readable against the background wall.
+            Rect2 door=GetBuildCellRect(layout.DoorCellX,layout.BaseLogicalLevel+1);
+            if(_artView.Intersects(door))
+            {
+                Color edge=PixelAtlas.ToColor(PxColor.Gold2);
+                DrawRect(new Rect2(door.Position,new Vector2(3,door.Size.Y*2)),edge);
+                DrawRect(new Rect2(new Vector2(door.End.X-3,door.Position.Y),new Vector2(3,door.Size.Y*2)),edge);
             }
         }
     }
 
-    private void AddTerrainCollisionRun(
-        int startCell,
-        int lengthCells,
-        int logicalLevel)
+    private void DrawPixelChests()
     {
-        if (_terrainCollisionBody is null
-            || lengthCells <= 0)
+        foreach (GeneratedStructureDefinition structure in _island.GeneratedStructures)
         {
-            return;
+            GeneratedChestDefinition chest = structure.Chest;
+            Rect2 rect = GetBuildCellRect(chest.CellX, chest.LogicalLevel);
+            if (!_artView.Intersects(rect)) continue;
+            bool empty = _state.GeneratedChestContents.TryGetValue(chest.ChestId, out var contents)
+                ? contents.IsEmpty : _state.IsGeneratedChestLooted(chest.ChestId);
+            string state = empty ? "open" : "0";
+            PixelAtlas.DrawBottom(this, $"prop/Chest/{state}", new Vector2(rect.GetCenter().X, rect.End.Y));
         }
+    }
 
-        Rect2 rect =
-            new(
-                LandLeftX
-                    + startCell
-                        * CellSize,
-                LevelToWorldY(
-                    logicalLevel),
-                lengthCells
-                    * CellSize,
-                CellSize);
+    private string ArtNaturalKey(NaturalFeatureSpawn feature)
+    {
+        int v = Math.Abs(feature.Variant % 3);
+        int large = HarvestRules.IsLarge(feature) ? 1 : 0;
+        return feature.Kind switch
+        {
+            NaturalFeatureKind.Tree => $"tree/{large}/{v}",
+            NaturalFeatureKind.Pine => $"pine/{large}/{v}",
+            NaturalFeatureKind.Palm => $"palm/{large}/{v}",
+            NaturalFeatureKind.Cactus => $"cactus/{large}/{v}",
+            NaturalFeatureKind.Rock => $"{(_island.Biome == BiomeType.Snowy ? "rock-snow" : "rock")}/{v}",
+            NaturalFeatureKind.Flower => v switch { 0 => "flower/RedFlower", 1 => "flower/YellowFlower", _ => "flower/BlueFlower" },
+            NaturalFeatureKind.Grass => $"{(_island.Biome == BiomeType.Jungle ? "grass-jungle" : "grass")}/{v}",
+            NaturalFeatureKind.Bush => $"bush/{v}",
+            NaturalFeatureKind.Mushroom => $"mushroom/{(feature.Variant == 0 ? 0 : 1)}",
+            _ => "missing",
+        };
+    }
 
-        var shape =
-            new RectangleShape2D
+    private void DrawPixelNature()
+    {
+        foreach (NaturalFeatureSpawn feature in _island.NaturalFeatures)
+        {
+            if (!Queries.NaturalPresent(feature)) continue;
+            Vector2 feet = GetFeatureWorldPosition(feature);
+            if (!new Rect2(feet - new Vector2(80, 160), new Vector2(160, 165)).Intersects(_artView)) continue;
+            string key = ArtNaturalKey(feature);
+            PixelAtlas.DrawBottom(this, key, feet);
+            if (_highlightedFeatureId == feature.FeatureId)
             {
-                Size =
-                    rect.Size,
+                float height = PixelAtlas.Get(key).GetHeight() * PixelAtlas.WorldPixelSize;
+                PixelAtlas.Bar(this, feet - new Vector2(24, height + 10), 48, _highlightedFeatureProgress);
+            }
+        }
+    }
+
+    private void DrawPixelResidents()
+    {
+        foreach (ResidentState resident in _residents)
+        {
+            if (resident.Status != ResidentStatus.World || resident.IslandId != _island.IslandId) continue;
+            Vector2 feet = Vector(ResidentService.Feet(resident,_island));
+            Rect2 bounds = Rect(ResidentService.Rect(resident,_island)).Grow(34);
+            if (!bounds.Intersects(_artView)) continue;
+            string key;
+            if(resident.Kind==ResidentKind.Bear && resident.Worker is { Assigned:true } worker)
+            {
+                bool left=worker.TravelToCellX<worker.TravelFromCellX;
+                int frame=(int)((Time.GetTicksMsec()/180UL)%4UL);
+                key=worker.Phase switch
+                {
+                    WorkerPhase.Working => $"bear/work/{frame}"+(left?"/left":""),
+                    WorkerPhase.TravellingToTarget or WorkerPhase.ReturningToChest => $"bear/walk/{(int)((Time.GetTicksMsec()/120UL)%8UL)}"+(left?"/left":""),
+                    _ => $"bear/idle/{resident.AppearanceVariant % 4}",
+                };
+            }
+            else key = resident.Kind switch
+            {
+                ResidentKind.Cat => "resident/cat",
+                ResidentKind.PolarBear => "resident/polar",
+                ResidentKind.Monkey => "resident/monkey",
+                _ => $"bear/idle/{resident.AppearanceVariant % 4}",
             };
-
-        _terrainCollisionBody.AddChild(
-            new CollisionShape2D
+            PixelAtlas.DrawBottom(this,key,feet);
+            PixelAtlas.Bar(this,feet-new Vector2(28,104),56,resident.Sympathy/100.0f);
+            if(resident.Worker is { Assigned:true } w)
             {
-                Shape =
-                    shape,
-                Position =
-                    rect.GetCenter(),
-            });
-    }
-
-    private bool IsSolidTerrainCell(
-        UndergroundCell cell)
-    {
-        if (cell.CellX < 0
-            || cell.CellX
-                >= _island.WidthCells
-            || cell.LogicalLevel
-                < IslandGenerationSettings.DeepestLogicalLevel
-            || cell.LogicalLevel
-                > _island.SurfaceLevels[cell.CellX])
-        {
-            return false;
-        }
-
-        if (_island.UndergroundOpenCells.Contains(
-                cell)
-            || _state.IsUndergroundCellMined(
-                cell))
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    private bool IsMineCellExposed(
-        UndergroundCell cell)
-    {
-        UndergroundCell[] neighbors =
-        [
-            new(
-                cell.CellX - 1,
-                cell.LogicalLevel),
-            new(
-                cell.CellX + 1,
-                cell.LogicalLevel),
-            new(
-                cell.CellX,
-                cell.LogicalLevel - 1),
-            new(
-                cell.CellX,
-                cell.LogicalLevel + 1),
-        ];
-
-        return neighbors.Any(
-            neighbor =>
-                !IsSolidTerrainCell(
-                    neighbor));
-    }
-
-    private Rect2 GetTerrainCellRect(
-        int cellX,
-        int logicalLevel)
-    {
-        return new Rect2(
-            LandLeftX
-                + cellX * CellSize,
-            LevelToWorldY(
-                logicalLevel),
-            CellSize,
-            CellSize);
-    }
-
-    private bool TryWorldToTerrainCell(
-        Vector2 worldPosition,
-        out int cellX,
-        out int logicalLevel)
-    {
-        cellX =
-            Mathf.FloorToInt(
-                (worldPosition.X
-                    - LandLeftX)
-                / CellSize);
-
-        logicalLevel =
-            Mathf.FloorToInt(
-                -worldPosition.Y
-                / CellSize)
-            + 1;
-
-        if (cellX < 0
-            || cellX >= _island.WidthCells
-            || logicalLevel
-                < IslandGenerationSettings.DeepestLogicalLevel
-            || logicalLevel
-                > IslandGenerationSettings.HighestLogicalLevel)
-        {
-            return false;
-        }
-
-        return logicalLevel
-            <= _island.SurfaceLevels[cellX];
-    }
-
-    private void RebuildBoatCollision()
-    {
-        if (_boatCollisionBody is null)
-        {
-            return;
-        }
-
-        foreach (Node child
-                 in _boatCollisionBody.GetChildren())
-        {
-            _boatCollisionBody.RemoveChild(
-                child);
-
-            child.QueueFree();
-        }
-
-        foreach (BoatSide side
-                 in Enum.GetValues<BoatSide>())
-        {
-            if (!_state.IsBoatBuilt(side))
-            {
-                continue;
+                float progress=w.TravelTotalSeconds>1e-9 ? (float)Math.Clamp(1.0-w.RemainingSeconds/w.TravelTotalSeconds,0,1) :
+                    w.Phase==WorkerPhase.Working ? (float)Math.Clamp(1.0-w.RemainingSeconds/1.5,0,1) : 0;
+                PixelAtlas.Bar(this,feet-new Vector2(28,94),56,progress);
             }
-
-            Vector2 center =
-                GetBoatWaterCenter(side);
-
-            var shape =
-                new RectangleShape2D
-                {
-                    Size =
-                        new Vector2(
-                            96.0f,
-                            18.0f),
-                };
-
-            _boatCollisionBody.AddChild(
-                new CollisionShape2D
-                {
-                    Shape =
-                        shape,
-                    Position =
-                        new Vector2(
-                            center.X,
-                            center.Y + 16.0f),
-                });
-        }
-    }
-
-    private void RebuildPlacedCollision()
-    {
-        if (_placedCollisionBody is null)
-        {
-            return;
-        }
-
-        foreach (Node child in _placedCollisionBody.GetChildren())
-        {
-            child.QueueFree();
-        }
-
-        foreach (PlacedObjectState placed in _state.PlacedObjects)
-        {
-            if (!PlacementRules.IsSolid(
-                placed.Item,
-                placed.Layer))
+            if (resident.Kind is ResidentKind.PolarBear or ResidentKind.Monkey)
             {
-                continue;
+                string chest = resident.Kind==ResidentKind.PolarBear ? "IceChest" : "GoldenChest";
+                string state = resident.SpecialChestClaimed ? "open" : "0";
+                PixelAtlas.DrawBottom(this,$"prop/{chest}/{state}",feet+new Vector2(50,0));
             }
-
-            Rect2 rect =
-                GetBuildCellRect(
-                    placed.CellX,
-                    placed.LogicalLevel);
-
-            var shape =
-                new RectangleShape2D
-                {
-                    Size = rect.Size,
-                };
-
-            _placedCollisionBody.AddChild(
-                new CollisionShape2D
-                {
-                    Shape = shape,
-                    Position = rect.GetCenter(),
-                });
+            if (_residentHighlight == resident.ResidentId)
+                DrawPixelCorners(bounds,PixelAtlas.ToColor(PxColor.Gold3));
         }
     }
 
-    private bool HasFloorSupport(
-        int cellX,
-        int logicalLevel)
-    {
-        if (logicalLevel
-            == _island.SurfaceLevels[cellX] + 1)
-        {
-            return true;
-        }
-
-        return _state.PlacedObjects.Any(
-            placed =>
-                placed.CellX == cellX
-                && placed.LogicalLevel
-                    == logicalLevel - 1
-                && PlacementRules.IsSolid(
-                    placed.Item,
-                    placed.Layer));
-    }
-
-    private bool HasAdjacentBlockSupport(
-        int cellX,
-        int logicalLevel,
-        BuildLayer layer)
+    private void DrawPixelPlaced(bool background)
     {
         foreach (PlacedObjectState placed in _state.PlacedObjects)
         {
-            if (!PlacementRules.IsBlock(placed.Item))
-            {
-                continue;
-            }
-
-            if (layer == BuildLayer.Solid
-                && placed.Layer != BuildLayer.Solid)
-            {
-                continue;
-            }
-
-            int dx =
-                Math.Abs(placed.CellX - cellX);
-            int dy =
-                Math.Abs(
-                    placed.LogicalLevel
-                    - logicalLevel);
-
-            if (dx + dy == 1)
-            {
-                return true;
-            }
+            if ((placed.Layer == BuildLayer.Background) != background) continue;
+            Rect2 rect = GetBuildCellRect(placed.CellX, placed.LogicalLevel);
+            if (!rect.Grow(160).Intersects(_artView)) continue;
+            DrawPixelObject(placed.Item, rect, placed.Layer, placed, false);
         }
-
-        return false;
     }
 
-    private void DrawUndergroundBackdrop()
+    private void DrawPixelObject(ItemType item, Rect2 rect, BuildLayer layer, PlacedObjectState? state, bool preview)
     {
-        float top =
-            LevelToWorldY(0);
-
-        float bottom =
-            WorldBottom
-            + CellSize;
-
-        if (bottom <= top)
+        Color tint = Colors.White;
+        if (layer == BuildLayer.Background) tint = new Color(0.64f, 0.68f, 0.66f, 1);
+        if (preview) tint.A = 0.48f;
+        Vector2 feet = new(rect.GetCenter().X, rect.End.Y);
+        string key;
+        if (PlacementRules.IsBlock(item))
         {
+            int variant = PixelAtlas.Variant(Mathf.RoundToInt(rect.Position.X / CellSize), Mathf.RoundToInt(rect.Position.Y / CellSize));
+            PixelAtlas.DrawRect(this, $"block/{item}/{variant}", rect, modulate: tint);
             return;
         }
-
-        // One continuous underground void. Mined/open cells above level 0
-        // reveal the normal sky/parallax; cells at level 0 and below reveal
-        // this cave background.
-        DrawRect(
-            new Rect2(
-                LandLeftX,
-                top,
-                LandRightX - LandLeftX,
-                bottom - top),
-            new Color(
-                0.035f,
-                0.045f,
-                0.055f));
-
-        Color grid =
-            new(
-                0.08f,
-                0.09f,
-                0.10f,
-                0.24f);
-
-        for (float y = top;
-             y <= bottom;
-             y += CellSize)
+        if (item == ItemType.Sapling)
         {
-            DrawLine(
-                new Vector2(
-                    LandLeftX,
-                    y),
-                new Vector2(
-                    LandRightX,
-                    y),
-                grid,
-                1.0f);
-        }
-    }
-
-    private void DrawUndergroundOpenings()
-    {
-        Color cave =
-            new(
-                0.035f,
-                0.045f,
-                0.055f);
-
-        Color caveGrid =
-            new(
-                0.08f,
-                0.09f,
-                0.10f,
-                0.55f);
-
-        foreach (UndergroundCell cell
-                 in _island.UndergroundOpenCells)
-        {
-            if (cell.CellX < 0
-                || cell.CellX
-                    >= _island.WidthCells
-                || cell.LogicalLevel > 0
-                || cell.LogicalLevel
-                    > _island.SurfaceLevels[
-                        cell.CellX])
+            double age = state?.GrowthSeconds ?? 0.0;
+            if (age >= WorldSimulationService.SaplingGrowthSeconds && state is not null)
             {
-                continue;
-            }
-
-            Rect2 rect =
-                GetTerrainCellRect(
-                    cell.CellX,
-                    cell.LogicalLevel);
-
-            DrawRect(
-                rect,
-                cave);
-
-            DrawRect(
-                rect,
-                caveGrid,
-                filled: false,
-                width: 1.0f);
-        }
-
-        foreach (UndergroundCell cell
-                 in _state.MinedUndergroundCells)
-        {
-            if (cell.LogicalLevel > 0)
-            {
-                continue;
-            }
-
-            Rect2 rect =
-                GetTerrainCellRect(
-                    cell.CellX,
-                    cell.LogicalLevel);
-
-            DrawRect(
-                rect,
-                cave);
-
-            DrawRect(
-                rect,
-                caveGrid,
-                filled: false,
-                width: 1.0f);
-        }
-    }
-
-    private void DrawUndergroundOres()
-    {
-        foreach ((UndergroundCell cell, UndergroundOreSpawn ore)
-                 in _island.UndergroundOres)
-        {
-            if (!IsSolidTerrainCell(cell)
-                || !IsMineCellExposed(cell))
-            {
-                continue;
-            }
-
-            Rect2 rect =
-                GetTerrainCellRect(
-                    cell.CellX,
-                    cell.LogicalLevel);
-
-            Color color =
-                ore.Kind switch
-                {
-                    UndergroundOreKind.Iron =>
-                        new Color(
-                            0.72f,
-                            0.48f,
-                            0.33f),
-
-                    _ =>
-                        new Color(
-                            0.72f,
-                            0.72f,
-                            0.72f),
-                };
-
-            DrawCircle(
-                rect.Position
-                    + new Vector2(
-                        15.0f,
-                        16.0f),
-                5.0f,
-                color);
-
-            DrawCircle(
-                rect.Position
-                    + new Vector2(
-                        31.0f,
-                        30.0f),
-                ore.Richness > 1
-                    ? 6.0f
-                    : 4.0f,
-                color);
-        }
-    }
-
-    private void DrawMineLadder()
-    {
-        float shaftLeft =
-            LandLeftX
-            + _island.MineShaftLeftCell
-                * CellSize;
-
-        float shaftWidth =
-            _island.MineShaftWidthCells
-            * CellSize;
-
-        float centerX =
-            shaftLeft
-            + shaftWidth / 2.0f;
-
-        int highestSurface =
-            Enumerable
-                .Range(
-                    _island.MineShaftLeftCell,
-                    _island.MineShaftWidthCells)
-                .Select(
-                    x =>
-                        _island.SurfaceLevels[x])
-                .Max();
-
-        float top =
-            LevelToWorldY(
-                highestSurface)
-            - 5.0f;
-
-        float bottom =
-            WorldBottom
-            + CellSize;
-
-        Color wood =
-            new(
-                0.44f,
-                0.27f,
-                0.11f);
-
-        DrawLine(
-            new Vector2(
-                centerX - 13.0f,
-                top),
-            new Vector2(
-                centerX - 13.0f,
-                bottom),
-            wood,
-            5.0f);
-
-        DrawLine(
-            new Vector2(
-                centerX + 13.0f,
-                top),
-            new Vector2(
-                centerX + 13.0f,
-                bottom),
-            wood,
-            5.0f);
-
-        for (float y = top + 14.0f;
-             y < bottom;
-             y += 24.0f)
-        {
-            DrawLine(
-                new Vector2(
-                    centerX - 13.0f,
-                    y),
-                new Vector2(
-                    centerX + 13.0f,
-                    y),
-                wood,
-                3.0f);
-        }
-    }
-
-    private void DrawGeneratedStructures()
-    {
-        foreach (GeneratedStructureDefinition structure
-                 in _island.GeneratedStructures)
-        {
-            float centerX =
-                LandLeftX
-                + (structure.CenterCellX
-                    + 0.5f)
-                    * CellSize;
-
-            float groundY =
-                LevelToWorldY(
-                    structure.BaseSurfaceLevel);
-
-            float width =
-                structure.WidthCells
-                * CellSize
-                * 0.88f;
-
-            if (structure.Kind
-                == GeneratedStructureKind.House)
-            {
-                Color wall =
-                    _island.Biome
-                        == BiomeType.Desert
-                            ? new Color(
-                                0.78f,
-                                0.58f,
-                                0.33f)
-                            : new Color(
-                                0.55f,
-                                0.35f,
-                                0.18f);
-
-                DrawRect(
-                    new Rect2(
-                        centerX - width / 2.0f,
-                        groundY - 120.0f,
-                        width,
-                        120.0f),
-                    wall);
-
-                DrawColoredPolygon(
-                    new Vector2[]
-                    {
-                        new(
-                            centerX - width / 2.0f - 14.0f,
-                            groundY - 120.0f),
-                        new(
-                            centerX,
-                            groundY - 190.0f),
-                        new(
-                            centerX + width / 2.0f + 14.0f,
-                            groundY - 120.0f),
-                    },
-                    new Color(
-                        0.34f,
-                        0.18f,
-                        0.09f));
-
-                DrawRect(
-                    new Rect2(
-                        centerX - 21.0f,
-                        groundY - 70.0f,
-                        42.0f,
-                        70.0f),
-                    new Color(
-                        0.20f,
-                        0.11f,
-                        0.05f));
+                int size = PlacedHarvestRules.IsLargeMatureTree(state) ? 1 : 0;
+                string species = state.PlantKind switch { NaturalFeatureKind.Pine => "pine", NaturalFeatureKind.Palm => "palm",
+                    NaturalFeatureKind.Cactus => "cactus", _ => "tree" };
+                key = $"{species}/{size}/{PixelAtlas.Variant(state.CellX, state.PlacementId, 3)}";
             }
             else
             {
-                Color stone =
-                    new(
-                        0.43f,
-                        0.45f,
-                        0.48f);
-
-                DrawRect(
-                    new Rect2(
-                        centerX - width / 2.0f,
-                        groundY - 145.0f,
-                        width,
-                        145.0f),
-                    stone);
-
-                float towerWidth =
-                    58.0f;
-
-                DrawRect(
-                    new Rect2(
-                        centerX - width / 2.0f,
-                        groundY - 205.0f,
-                        towerWidth,
-                        205.0f),
-                    new Color(
-                        0.37f,
-                        0.39f,
-                        0.42f));
-
-                DrawRect(
-                    new Rect2(
-                        centerX + width / 2.0f - towerWidth,
-                        groundY - 205.0f,
-                        towerWidth,
-                        205.0f),
-                    new Color(
-                        0.37f,
-                        0.39f,
-                        0.42f));
-
-                DrawRect(
-                    new Rect2(
-                        centerX - 28.0f,
-                        groundY - 85.0f,
-                        56.0f,
-                        85.0f),
-                    new Color(
-                        0.18f,
-                        0.19f,
-                        0.21f));
+                int stage = Math.Clamp((int)(age / WorldSimulationService.SaplingGrowthSeconds * 3), 0, 2);
+                key = $"sapling/{stage}";
             }
         }
-    }
-
-    private void DrawGeneratedChests()
-    {
-        foreach (GeneratedStructureDefinition structure
-                 in _island.GeneratedStructures)
+        else if (PlacementRules.IsFlower(item)) key = $"flower/{item}";
+        else if (item == ItemType.Grass) key = "grass/0";
+        else
         {
-            GeneratedChestDefinition chest =
-                structure.Chest;
-
-            Rect2 cellRect =
-                GetBuildCellRect(
-                    chest.CellX,
-                    chest.LogicalLevel);
-
-            Vector2 center =
-                cellRect.GetCenter();
-
-            bool looted =
-                _state.IsGeneratedChestLooted(
-                    chest.ChestId);
-
-            Color wood =
-                looted
-                    ? new Color(
-                        0.28f,
-                        0.18f,
-                        0.10f)
-                    : new Color(
-                        0.48f,
-                        0.25f,
-                        0.08f);
-
-            DrawRect(
-                new Rect2(
-                    center.X - 20.0f,
-                    cellRect.End.Y - 30.0f,
-                    40.0f,
-                    27.0f),
-                wood);
-
-            DrawRect(
-                new Rect2(
-                    center.X - 4.0f,
-                    cellRect.End.Y - 20.0f,
-                    8.0f,
-                    10.0f),
-                new Color(
-                    0.94f,
-                    0.72f,
-                    0.16f));
-
-            if (looted)
+            int frame = item is ItemType.Forge or ItemType.Cauldron ? _artFrame : 0;
+            key = $"prop/{item}/{frame}";
+        }
+        PixelAtlas.DrawBottom(this, key, feet, modulate: tint);
+        if (!preview && state is not null)
+        {
+            if (state.Item == ItemType.Beehive)
             {
-                DrawLine(
-                    new Vector2(
-                        center.X - 20.0f,
-                        cellRect.End.Y - 31.0f),
-                    new Vector2(
-                        center.X + 18.0f,
-                        cellRect.End.Y - 42.0f),
-                    new Color(
-                        0.32f,
-                        0.20f,
-                        0.10f),
-                    6.0f);
-            }
-        }
-    }
-
-    private void DrawMineIndicator()
-    {
-        if (_highlightedMineCell is null)
-        {
-            return;
-        }
-
-        Rect2 rect =
-            GetTerrainCellRect(
-                _highlightedMineCell.Value.CellX,
-                _highlightedMineCell.Value.LogicalLevel);
-
-        Color highlight =
-            new(
-                1.0f,
-                0.78f,
-                0.22f,
-                0.95f);
-
-        DrawRect(
-            rect,
-            new Color(
-                highlight.R,
-                highlight.G,
-                highlight.B,
-                0.14f));
-
-        DrawRect(
-            rect,
-            highlight,
-            filled: false,
-            width: 2.0f);
-
-        float barWidth =
-            rect.Size.X - 10.0f;
-
-        DrawRect(
-            new Rect2(
-                rect.Position.X + 5.0f,
-                rect.Position.Y + 5.0f,
-                barWidth,
-                6.0f),
-            new Color(
-                0.02f,
-                0.025f,
-                0.03f,
-                0.82f));
-
-        DrawRect(
-            new Rect2(
-                rect.Position.X + 6.0f,
-                rect.Position.Y + 6.0f,
-                (barWidth - 2.0f)
-                    * _highlightedMineProgress,
-                4.0f),
-            highlight);
-    }
-
-    private void DrawPlacedObjects(
-        bool backgroundOnly)
-    {
-        foreach (PlacedObjectState placed in _state.PlacedObjects)
-        {
-            bool isBackground =
-                placed.Layer == BuildLayer.Background;
-
-            if (isBackground != backgroundOnly)
-            {
-                continue;
-            }
-
-            DrawPlacedObject(
-                placed.Item,
-                placed.CellX,
-                placed.LogicalLevel,
-                placed.Layer,
-                preview: false);
-        }
-    }
-
-    private void DrawBuildPreview()
-    {
-        if (_previewItem is null)
-        {
-            return;
-        }
-
-        Rect2 rect =
-            GetBuildCellRect(
-                _previewCellX,
-                _previewLogicalLevel);
-
-        Color status =
-            _previewValid
-                ? new Color(
-                    0.22f,
-                    0.92f,
-                    0.42f,
-                    0.28f)
-                : new Color(
-                    0.95f,
-                    0.20f,
-                    0.22f,
-                    0.28f);
-
-        DrawRect(
-            rect,
-            status);
-
-        DrawRect(
-            rect,
-            new Color(
-                status.R,
-                status.G,
-                status.B,
-                0.95f),
-            filled: false,
-            width: 3.0f);
-
-        DrawPlacedObject(
-            _previewItem.Value,
-            _previewCellX,
-            _previewLogicalLevel,
-            _previewLayer,
-            preview: true);
-    }
-
-    private void DrawPlacedObject(
-        ItemType item,
-        int cellX,
-        int logicalLevel,
-        BuildLayer layer,
-        bool preview)
-    {
-        Rect2 rect =
-            GetBuildCellRect(
-                cellX,
-                logicalLevel);
-
-        float alpha =
-            preview
-                ? 0.55f
-                : (layer == BuildLayer.Background
-                    ? 0.48f
-                    : 1.0f);
-
-        Color WithAlpha(Color color)
-        {
-            return new Color(
-                color.R,
-                color.G,
-                color.B,
-                color.A * alpha);
-        }
-
-        Vector2 center =
-            rect.GetCenter();
-
-        switch (item)
-        {
-            case ItemType.Wood:
-                DrawRect(
-                    rect,
-                    WithAlpha(
-                        new Color(
-                            0.45f,
-                            0.23f,
-                            0.09f)));
-                DrawLine(
-                    rect.Position
-                        + new Vector2(5.0f, 12.0f),
-                    rect.Position
-                        + new Vector2(
-                            rect.Size.X - 5.0f,
-                            12.0f),
-                    WithAlpha(
-                        new Color(
-                            0.66f,
-                            0.38f,
-                            0.16f)),
-                    3.0f);
-                break;
-
-            case ItemType.Stone:
-                DrawRect(
-                    rect,
-                    WithAlpha(
-                        new Color(
-                            0.42f,
-                            0.44f,
-                            0.47f)));
-                DrawLine(
-                    rect.Position
-                        + new Vector2(7.0f, 8.0f),
-                    rect.End
-                        - new Vector2(9.0f, 12.0f),
-                    WithAlpha(
-                        new Color(
-                            0.29f,
-                            0.30f,
-                            0.32f)),
-                    2.0f);
-                break;
-
-            case ItemType.Sandstone:
-                DrawRect(
-                    rect,
-                    WithAlpha(
-                        new Color(
-                            0.82f,
-                            0.61f,
-                            0.31f)));
-                break;
-
-            case ItemType.Cactus:
-                DrawRect(
-                    rect,
-                    WithAlpha(
-                        new Color(
-                            0.11f,
-                            0.43f,
-                            0.21f)));
-                break;
-
-            case ItemType.Sapling:
-                DrawPlacedSapling(
-                    cellX,
-                    logicalLevel,
-                    alpha,
-                    preview);
-                break;
-
-            case ItemType.RedFlower:
-            case ItemType.YellowFlower:
-            case ItemType.BlueFlower:
-            case ItemType.OrangeFlower:
-            case ItemType.PurpleFlower:
-            case ItemType.PinkFlower:
-                DrawPlacedFlower(
-                    item,
-                    center.X,
-                    rect.End.Y,
-                    alpha);
-                break;
-
-            case ItemType.Grass:
-                DrawLine(
-                    new Vector2(
-                        center.X - 10.0f,
-                        rect.End.Y),
-                    new Vector2(
-                        center.X - 3.0f,
-                        rect.End.Y - 25.0f),
-                    WithAlpha(
-                        new Color(
-                            0.12f,
-                            0.54f,
-                            0.18f)),
-                    4.0f);
-                DrawLine(
-                    new Vector2(
-                        center.X + 9.0f,
-                        rect.End.Y),
-                    new Vector2(
-                        center.X + 2.0f,
-                        rect.End.Y - 30.0f),
-                    WithAlpha(
-                        new Color(
-                            0.12f,
-                            0.54f,
-                            0.18f)),
-                    4.0f);
-                break;
-
-            case ItemType.Beehive:
-                DrawRect(
-                    new Rect2(
-                        center.X - 17.0f,
-                        rect.End.Y - 35.0f,
-                        34.0f,
-                        31.0f),
-                    WithAlpha(
-                        new Color(
-                            0.91f,
-                            0.65f,
-                            0.10f)));
-                DrawLine(
-                    new Vector2(
-                        center.X - 17.0f,
-                        rect.End.Y - 24.0f),
-                    new Vector2(
-                        center.X + 17.0f,
-                        rect.End.Y - 24.0f),
-                    WithAlpha(
-                        new Color(
-                            0.54f,
-                            0.32f,
-                            0.06f)),
-                    3.0f);
-                DrawCircle(
-                    new Vector2(
-                        center.X,
-                        rect.End.Y - 14.0f),
-                    4.0f,
-                    WithAlpha(
-                        new Color(
-                            0.18f,
-                            0.12f,
-                            0.04f)));
-
-                if (!preview)
-                {
-                    PlacedObjectState? hiveState =
-                        _state.PlacedObjects.FirstOrDefault(
-                            placed =>
-                                placed.CellX == cellX
-                                && placed.LogicalLevel == logicalLevel
-                                && placed.Item == ItemType.Beehive);
-
-                    if (hiveState is not null
-                        && hiveState.StoredOutput > 0)
+                for (int i = 0; i < Math.Min(state.StoredOutput, WorldSimulationService.HoneyCapacity); i++)
+                    PixelAtlas.DrawBottom(this, "icon/Honey", feet + new Vector2(-16 + i * 16, -48), 0.6f);
+                // Bees are visual only. Their paths never determine honey production.
+                if (state.ProductionSeconds > 0 || state.StoredOutput > 0)
+                    for (int i = 0; i < 2; i++)
                     {
-                        for (int i = 0;
-                             i < hiveState.StoredOutput;
-                             i++)
-                        {
-                            DrawCircle(
-                                new Vector2(
-                                    center.X
-                                        - 10.0f
-                                        + i * 10.0f,
-                                    rect.Position.Y
-                                        - 8.0f),
-                                4.0f,
-                                new Color(
-                                    1.0f,
-                                    0.70f,
-                                    0.08f,
-                                    alpha));
-                        }
+                        double angle = _artClock * 1.3 + i * 2.7 + state.PlacementId;
+                        Vector2 offset = new((float)Math.Cos(angle) * 22, -46 + (float)Math.Sin(angle * 1.3) * 9);
+                        PixelAtlas.DrawBottom(this, $"bee/{_artFrame % 2}", feet + offset, 1.0f);
                     }
-                }
-
-                break;
-
-            case ItemType.Chest:
-                DrawRect(
-                    new Rect2(
-                        center.X - 19.0f,
-                        rect.End.Y - 31.0f,
-                        38.0f,
-                        29.0f),
-                    WithAlpha(
-                        new Color(
-                            0.39f,
-                            0.19f,
-                            0.07f)));
-                DrawRect(
-                    new Rect2(
-                        center.X - 3.0f,
-                        rect.End.Y - 20.0f,
-                        6.0f,
-                        9.0f),
-                    WithAlpha(
-                        new Color(
-                            0.95f,
-                            0.72f,
-                            0.16f)));
-                break;
-
-            case ItemType.Forge:
-                DrawRect(
-                    new Rect2(
-                        center.X - 20.0f,
-                        rect.End.Y - 36.0f,
-                        40.0f,
-                        34.0f),
-                    WithAlpha(
-                        new Color(
-                            0.18f,
-                            0.19f,
-                            0.21f)));
-                DrawCircle(
-                    new Vector2(
-                        center.X,
-                        rect.End.Y - 16.0f),
-                    8.0f,
-                    WithAlpha(
-                        new Color(
-                            1.0f,
-                            0.35f,
-                            0.05f)));
-                break;
-
-            case ItemType.Anvil:
-                DrawRect(
-                    new Rect2(
-                        center.X - 20.0f,
-                        rect.End.Y - 28.0f,
-                        40.0f,
-                        10.0f),
-                    WithAlpha(
-                        new Color(
-                            0.35f,
-                            0.37f,
-                            0.40f)));
-                DrawRect(
-                    new Rect2(
-                        center.X - 8.0f,
-                        rect.End.Y - 18.0f,
-                        16.0f,
-                        16.0f),
-                    WithAlpha(
-                        new Color(
-                            0.29f,
-                            0.31f,
-                            0.34f)));
-                break;
-
-            case ItemType.Cauldron:
-                DrawCircle(
-                    new Vector2(
-                        center.X,
-                        rect.End.Y - 18.0f),
-                    17.0f,
-                    WithAlpha(
-                        new Color(
-                            0.13f,
-                            0.15f,
-                            0.16f)));
-                DrawRect(
-                    new Rect2(
-                        center.X - 20.0f,
-                        rect.End.Y - 35.0f,
-                        40.0f,
-                        7.0f),
-                    WithAlpha(
-                        new Color(
-                            0.08f,
-                            0.09f,
-                            0.10f)));
-                break;
-        }
-
-        if (!preview
-            && _highlightedPlacementId is not null)
-        {
-            PlacedObjectState? highlighted =
-                _state.PlacedObjects.FirstOrDefault(
-                    placed =>
-                        placed.PlacementId
-                        == _highlightedPlacementId.Value);
-
-            if (highlighted is not null
-                && highlighted.CellX == cellX
-                && highlighted.LogicalLevel == logicalLevel)
+            }
+            if (_highlightedPlacementId == state.PlacementId)
             {
-                DrawPlacedHarvestIndicator(
-                    rect,
-                    highlighted);
+                float height = PixelAtlas.Get(key).GetHeight() * PixelAtlas.WorldPixelSize;
+                PixelAtlas.Bar(this, feet - new Vector2(24, height + 10), 48, _highlightedPlacementProgress);
             }
         }
     }
 
-    private void DrawPlacedHarvestIndicator(
-        Rect2 rect,
-        PlacedObjectState placed)
+    private void DrawPixelBoats()
     {
-        float top =
-            placed.Item == ItemType.Sapling
-                ? rect.Position.Y - 54.0f
-                : rect.Position.Y - 8.0f;
-
-        float width = 58.0f;
-        float left =
-            rect.GetCenter().X
-            - width / 2.0f;
-
-        DrawRect(
-            new Rect2(
-                left,
-                top,
-                width,
-                7.0f),
-            new Color(
-                0.02f,
-                0.025f,
-                0.03f,
-                0.82f));
-
-        DrawRect(
-            new Rect2(
-                left + 1.0f,
-                top + 1.0f,
-                (width - 2.0f)
-                    * _highlightedPlacementProgress,
-                5.0f),
-            new Color(
-                1.0f,
-                0.83f,
-                0.25f,
-                0.95f));
+        foreach (BoatSide side in Enum.GetValues<BoatSide>())
+        {
+            int start = side == BoatSide.Left ? 0 : _island.WidthCells - BoatConstructionShoreCells;
+            float shoreX = LandLeftX + start * CellSize + BoatConstructionShoreCells * CellSize / 2.0f;
+            int edge = side == BoatSide.Left ? 0 : _island.WidthCells - 1;
+            float groundY = LevelToWorldY(_island.SurfaceLevels[edge]);
+            if (new Rect2(shoreX - 120, groundY - 90, 240, 120).Intersects(_artView))
+                PixelAtlas.DrawBottom(this, "shore-site", new Vector2(shoreX, groundY + 2));
+            if (!_state.IsBoatBuilt(side)) continue;
+            Vector2 water = GetBoatWaterCenter(side); // Identical origin to the hull collider.
+            Rect2 boatRect = new(water.X - 48, water.Y + 7 - 66, 96, 84);
+            if (_artView.Intersects(boatRect))
+                PixelAtlas.DrawRect(this, "boat", boatRect, flip: side == BoatSide.Left);
+        }
     }
 
-    private void DrawPlacedSapling(
-        int cellX,
-        int logicalLevel,
-        float alpha,
-        bool preview)
+    private void DrawPixelIndicators()
     {
-        Rect2 rect =
-            GetBuildCellRect(
-                cellX,
-                logicalLevel);
-
-        Vector2 center =
-            rect.GetCenter();
-
-        double growthSeconds = 0.0;
-
-        if (!preview)
+        if (_highlightedMineCell is not null)
         {
-            PlacedObjectState? state =
-                _state.PlacedObjects.FirstOrDefault(
-                    placed =>
-                        placed.CellX == cellX
-                        && placed.LogicalLevel == logicalLevel
-                        && placed.Item == ItemType.Sapling);
-
-            growthSeconds =
-                state?.GrowthSeconds ?? 0.0;
-        }
-
-        float ratio =
-            preview
-                ? 0.0f
-                : (float)Math.Clamp(
-                    growthSeconds
-                    / WorldSimulationService.SaplingGrowthSeconds,
-                    0.0,
-                    1.0);
-
-        if (ratio >= 1.0f)
-        {
-            PlacedObjectState? matureState =
-                preview
-                    ? null
-                    : _state.PlacedObjects.FirstOrDefault(
-                        placed =>
-                            placed.CellX == cellX
-                            && placed.LogicalLevel == logicalLevel
-                            && placed.Item == ItemType.Sapling);
-
-            bool large =
-                matureState is not null
-                && PlacedHarvestRules.IsLargeMatureTree(
-                    matureState);
-
-            float height =
-                large
-                    ? 110.0f
-                    : 84.0f;
-
-            DrawRect(
-                new Rect2(
-                    center.X - 6.0f,
-                    rect.End.Y - height + 28.0f,
-                    12.0f,
-                    height - 28.0f),
-                new Color(
-                    0.33f,
-                    0.18f,
-                    0.08f,
-                    alpha));
-
-            Color leaves =
-                new(
-                    0.10f,
-                    0.45f,
-                    0.18f,
-                    alpha);
-
-            DrawCircle(
-                new Vector2(
-                    center.X,
-                    rect.End.Y - height + 18.0f),
-                26.0f,
-                leaves);
-
-            DrawCircle(
-                new Vector2(
-                    center.X - 17.0f,
-                    rect.End.Y - height + 31.0f),
-                18.0f,
-                leaves);
-
-            DrawCircle(
-                new Vector2(
-                    center.X + 17.0f,
-                    rect.End.Y - height + 31.0f),
-                18.0f,
-                leaves);
-
-            return;
-        }
-
-        float saplingHeight =
-            24.0f + ratio * 30.0f;
-
-        DrawLine(
-            new Vector2(
-                center.X,
-                rect.End.Y),
-            new Vector2(
-                center.X,
-                rect.End.Y - saplingHeight),
-            new Color(
-                0.35f,
-                0.20f,
-                0.08f,
-                alpha),
-            4.0f);
-
-        DrawCircle(
-            new Vector2(
-                center.X - 7.0f,
-                rect.End.Y - saplingHeight),
-            8.0f + ratio * 4.0f,
-            new Color(
-                0.12f,
-                0.52f,
-                0.21f,
-                alpha));
-
-        DrawCircle(
-            new Vector2(
-                center.X + 7.0f,
-                rect.End.Y - saplingHeight + 3.0f),
-            8.0f + ratio * 4.0f,
-            new Color(
-                0.12f,
-                0.52f,
-                0.21f,
-                alpha));
-    }
-
-    private void DrawPlacedFlower(
-        ItemType item,
-        float x,
-        float groundY,
-        float alpha)
-    {
-        Color petal =
-            item switch
+            Rect2 rect = GetTerrainCellRect(_highlightedMineCell.Value.CellX, _highlightedMineCell.Value.LogicalLevel);
+            DrawPixelCorners(rect, PixelAtlas.ToColor(PxColor.Gold3));
+            PixelAtlas.Bar(this, rect.Position + new Vector2(4, 4), CellSize - 8, _highlightedMineProgress);
+            if (_highlightedMineProgress > 0.3f)
             {
-                ItemType.RedFlower =>
-                    new Color(0.95f, 0.20f, 0.18f, alpha),
-                ItemType.YellowFlower =>
-                    new Color(0.95f, 0.80f, 0.15f, alpha),
-                ItemType.BlueFlower =>
-                    new Color(0.20f, 0.40f, 0.95f, alpha),
-                ItemType.OrangeFlower =>
-                    new Color(0.95f, 0.45f, 0.10f, alpha),
-                ItemType.PurpleFlower =>
-                    new Color(0.58f, 0.16f, 0.78f, alpha),
-                ItemType.PinkFlower =>
-                    new Color(1.0f, 0.55f, 0.70f, alpha),
-                _ =>
-                    new Color(1.0f, 1.0f, 1.0f, alpha),
-            };
-
-        DrawLine(
-            new Vector2(x, groundY),
-            new Vector2(x, groundY - 20.0f),
-            new Color(
-                0.12f,
-                0.45f,
-                0.18f,
-                alpha),
-            3.0f);
-
-        DrawCircle(
-            new Vector2(x, groundY - 22.0f),
-            7.0f,
-            petal);
-
-        DrawCircle(
-            new Vector2(x, groundY - 22.0f),
-            2.0f,
-            new Color(
-                1.0f,
-                0.84f,
-                0.22f,
-                alpha));
-    }
-
-    private void DrawDistantBackground()
-    {
-        Color distant = _palette.Distant;
-        float horizonY = -260.0f;
-        float spacing = 420.0f;
-
-        int count =
-            (int)Math.Ceiling(
-                WorldWidth / spacing) + 1;
-
-        for (int i = 0; i < count; i++)
-        {
-            float x =
-                i * spacing - 120.0f;
-            float radius =
-                _island.Biome == BiomeType.Mountain
-                    ? 250.0f
-                    : 170.0f;
-
-            DrawCircle(
-                new Vector2(
-                    x,
-                    horizonY + radius),
-                radius,
-                distant);
-        }
-    }
-
-    private void DrawOcean()
-    {
-        float oceanTop = 0.0f;
-        float oceanHeight =
-            6.0f * CellSize;
-
-        DrawRect(
-            new Rect2(
-                0.0f,
-                oceanTop,
-                LandLeftX,
-                oceanHeight),
-            _palette.Water);
-
-        DrawRect(
-            new Rect2(
-                LandRightX,
-                oceanTop,
-                WorldWidth - LandRightX,
-                oceanHeight),
-            _palette.Water);
-
-        Color foam =
-            new(0.82f, 0.94f, 1.0f, 0.78f);
-
-        DrawLine(
-            new Vector2(
-                0.0f,
-                oceanTop + 4.0f),
-            new Vector2(
-                LandLeftX,
-                oceanTop + 4.0f),
-            foam,
-            3.0f);
-
-        DrawLine(
-            new Vector2(
-                LandRightX,
-                oceanTop + 4.0f),
-            new Vector2(
-                WorldWidth,
-                oceanTop + 4.0f),
-            foam,
-            3.0f);
-    }
-
-    private void DrawTerrain()
-    {
-        int highestSurface =
-            _island.SurfaceLevels.Max();
-
-        for (int logicalLevel = highestSurface;
-             logicalLevel
-                >= IslandGenerationSettings.DeepestLogicalLevel;
-             logicalLevel--)
-        {
-            int runStart =
-                -1;
-
-            for (int cellX = 0;
-                 cellX <= _island.WidthCells;
-                 cellX++)
-            {
-                bool solid =
-                    cellX < _island.WidthCells
-                    && IsSolidTerrainCell(
-                        new UndergroundCell(
-                            cellX,
-                            logicalLevel));
-
-                if (solid
-                    && runStart < 0)
+                // Cosmetic chips/cracks on the hovered tile, not a second mining model.
+                Vector2 c = rect.GetCenter();
+                DrawLine(c - new Vector2(5, 8), c + new Vector2(1, 0), PixelAtlas.ToColor(PxColor.Ink), 2);
+                if (_highlightedMineProgress > 0.6f)
                 {
-                    runStart =
-                        cellX;
-                }
-
-                if ((!solid
-                        || cellX == _island.WidthCells)
-                    && runStart >= 0)
-                {
-                    int runLength =
-                        cellX - runStart;
-
-                    DrawRect(
-                        new Rect2(
-                            LandLeftX
-                                + runStart
-                                    * CellSize,
-                            LevelToWorldY(
-                                logicalLevel),
-                            runLength
-                                * CellSize,
-                            CellSize),
-                        _palette.Ground);
-
-                    runStart =
-                        -1;
+                    DrawLine(c, c + new Vector2(9, 6), PixelAtlas.ToColor(PxColor.Ink), 2);
+                    DrawLine(c, c + new Vector2(-4, 10), PixelAtlas.ToColor(PxColor.Ink), 2);
                 }
             }
         }
-
-        // Draw the biome surface cap only where the cell above is open.
-        for (int cellX = 0;
-             cellX < _island.WidthCells;
-             cellX++)
+        if (_entityHighlight is not null) DrawPixelCorners(_entityHighlight.Value, PixelAtlas.ToColor(PxColor.Gold3));
+        if (_previewItem is not null)
         {
-            for (int logicalLevel =
-                    _island.SurfaceLevels[cellX];
-                 logicalLevel
-                    >= IslandGenerationSettings.DeepestLogicalLevel;
-                 logicalLevel--)
-            {
-                var cell =
-                    new UndergroundCell(
-                        cellX,
-                        logicalLevel);
-
-                if (!IsSolidTerrainCell(cell))
-                {
-                    continue;
-                }
-
-                var above =
-                    new UndergroundCell(
-                        cellX,
-                        logicalLevel + 1);
-
-                if (IsSolidTerrainCell(above))
-                {
-                    continue;
-                }
-
-                Rect2 rect =
-                    GetTerrainCellRect(
-                        cellX,
-                        logicalLevel);
-
-                DrawRect(
-                    new Rect2(
-                        rect.Position.X,
-                        rect.Position.Y,
-                        rect.Size.X,
-                        8.0f),
-                    _palette.Surface);
-            }
+            Rect2 rect = GetBuildCellRect(_previewCellX, _previewLogicalLevel);
+            Color ink = PixelAtlas.ToColor(_previewValid ? PxColor.Green4 : PxColor.Red2);
+            DrawRect(rect, new Color(ink.R, ink.G, ink.B, 0.16f));
+            DrawPixelObject(_previewItem.Value, rect, _previewLayer, null, true);
+            DrawPixelCorners(rect, ink);
         }
     }
 
-    private void DrawBoatSites()
+    private void DrawPixelCorners(Rect2 rect, Color ink)
     {
-        DrawBoatSite(BoatSide.Left);
-        DrawBoatSite(BoatSide.Right);
-    }
-
-    private void DrawBoatSite(BoatSide side)
-    {
-        int shoreStartCell =
-            side == BoatSide.Left
-                ? 0
-                : _island.WidthCells
-                    - BoatConstructionShoreCells;
-
-        float shoreX =
-            LandLeftX
-            + shoreStartCell * CellSize;
-
-        float shoreWidth =
-            BoatConstructionShoreCells
-            * CellSize;
-
-        int edgeCell =
-            side == BoatSide.Left
-                ? 0
-                : _island.WidthCells - 1;
-
-        float groundY =
-            LevelToWorldY(
-                _island.SurfaceLevels[edgeCell]);
-
-        bool built =
-            _state.IsBoatBuilt(side);
-
-        Color marker =
-            built
-                ? new Color(
-                    0.44f,
-                    0.28f,
-                    0.12f,
-                    0.42f)
-                : new Color(
-                    _palette.Accent.R,
-                    _palette.Accent.G,
-                    _palette.Accent.B,
-                    0.42f);
-
-        DrawRect(
-            new Rect2(
-                shoreX,
-                groundY - 7.0f,
-                shoreWidth,
-                14.0f),
-            marker);
-
-        DrawLine(
-            new Vector2(
-                side == BoatSide.Left
-                    ? LandLeftX
-                    : LandRightX,
-                groundY - 3.0f),
-            new Vector2(
-                side == BoatSide.Left
-                    ? LandLeftX
-                    : LandRightX,
-                groundY + 18.0f),
-            _palette.Accent,
-            4.0f);
-
-        if (!built)
+        const float thickness = 2, length = 10;
+        foreach (Vector2 corner in new[] { rect.Position, new Vector2(rect.End.X, rect.Position.Y),
+            new Vector2(rect.Position.X, rect.End.Y), rect.End })
         {
-            return;
-        }
-
-        Vector2 center =
-            GetBoatWaterCenter(side);
-
-        Color hull =
-            new(0.39f, 0.20f, 0.08f);
-
-        DrawRect(
-            new Rect2(
-                center.X - 48.0f,
-                center.Y + 7.0f,
-                96.0f,
-                18.0f),
-            hull);
-
-        DrawLine(
-            new Vector2(
-                center.X,
-                center.Y + 6.0f),
-            new Vector2(
-                center.X,
-                center.Y - 55.0f),
-            new Color(
-                0.29f,
-                0.17f,
-                0.08f),
-            5.0f);
-
-        float sailDirection =
-            side == BoatSide.Left
-                ? -1.0f
-                : 1.0f;
-
-        DrawColoredPolygon(
-            new Vector2[]
-            {
-                new Vector2(
-                    center.X,
-                    center.Y - 52.0f),
-                new Vector2(
-                    center.X,
-                    center.Y - 8.0f),
-                new Vector2(
-                    center.X
-                        + 38.0f * sailDirection,
-                    center.Y - 17.0f),
-            },
-            new Color(
-                0.89f,
-                0.82f,
-                0.64f));
-
-        DrawLine(
-            new Vector2(
-                center.X - 48.0f,
-                center.Y + 7.0f),
-            new Vector2(
-                center.X + 48.0f,
-                center.Y + 7.0f),
-            new Color(
-                0.67f,
-                0.39f,
-                0.13f),
-            4.0f);
-    }
-
-    private void DrawNaturalFeatures()
-    {
-        foreach (NaturalFeatureSpawn feature
-                 in _island.NaturalFeatures)
-        {
-            if (_state.IsNaturalFeatureHarvested(
-                feature.FeatureId))
-            {
-                continue;
-            }
-
-            Vector2 position =
-                GetFeatureWorldPosition(feature);
-            float x = position.X;
-            float y = position.Y;
-
-            switch (feature.Kind)
-            {
-                case NaturalFeatureKind.Tree:
-                    DrawTree(
-                        x,
-                        y,
-                        feature.Variant,
-                        HarvestRules.IsLarge(feature));
-                    break;
-
-                case NaturalFeatureKind.Pine:
-                    DrawPine(
-                        x,
-                        y,
-                        feature.Variant,
-                        HarvestRules.IsLarge(feature));
-                    break;
-
-                case NaturalFeatureKind.Palm:
-                    DrawPalm(
-                        x,
-                        y,
-                        feature.Variant,
-                        HarvestRules.IsLarge(feature));
-                    break;
-
-                case NaturalFeatureKind.Cactus:
-                    DrawCactus(
-                        x,
-                        y,
-                        feature.Variant,
-                        HarvestRules.IsLarge(feature));
-                    break;
-
-                case NaturalFeatureKind.Rock:
-                    DrawRock(x, y, feature.Variant);
-                    break;
-
-                case NaturalFeatureKind.Flower:
-                    DrawFlower(x, y, feature.Variant);
-                    break;
-
-                case NaturalFeatureKind.Grass:
-                    DrawGrass(x, y);
-                    break;
-
-                case NaturalFeatureKind.Bush:
-                    DrawBush(x, y, feature.Variant);
-                    break;
-
-                case NaturalFeatureKind.Mushroom:
-                    DrawMushroom(x, y, feature.Variant);
-                    break;
-            }
-
-            if (_highlightedFeatureId
-                == feature.FeatureId)
-            {
-                DrawHarvestIndicator(
-                    feature,
-                    x,
-                    y);
-            }
+            float sx = corner.X == rect.Position.X ? 1 : -1;
+            float sy = corner.Y == rect.Position.Y ? 1 : -1;
+            DrawLine(corner, corner + new Vector2(length * sx, 0), ink, thickness);
+            DrawLine(corner, corner + new Vector2(0, length * sy), ink, thickness);
         }
     }
 
-    private void DrawHarvestIndicator(
-        NaturalFeatureSpawn feature,
-        float x,
-        float y)
-    {
-        Color highlight =
-            new(
-                1.0f,
-                0.83f,
-                0.25f,
-                0.88f);
-
-        float radius =
-            feature.Kind switch
-            {
-                NaturalFeatureKind.Tree
-                    or NaturalFeatureKind.Pine
-                    or NaturalFeatureKind.Palm
-                        => 38.0f,
-                NaturalFeatureKind.Bush
-                    or NaturalFeatureKind.Cactus
-                        => 28.0f,
-                _ => 22.0f,
-            };
-
-        DrawArc(
-            new Vector2(
-                x,
-                y - radius),
-            radius,
-            0.0f,
-            Mathf.Tau,
-            40,
-            highlight,
-            2.5f,
-            true);
-
-        float barWidth = 64.0f;
-        float barY =
-            y - radius * 2.0f - 14.0f;
-
-        DrawRect(
-            new Rect2(
-                x - barWidth / 2.0f,
-                barY,
-                barWidth,
-                7.0f),
-            new Color(
-                0.02f,
-                0.025f,
-                0.03f,
-                0.80f));
-
-        DrawRect(
-            new Rect2(
-                x - barWidth / 2.0f + 1.0f,
-                barY + 1.0f,
-                (barWidth - 2.0f)
-                    * _highlightedFeatureProgress,
-                5.0f),
-            highlight);
-    }
-
-    private void DrawTree(
-        float x,
-        float y,
-        int variant,
-        bool large)
-    {
-        float height =
-            (large ? 105.0f : 78.0f)
-            + variant * 5.0f;
-        Color trunk =
-            new(0.33f, 0.18f, 0.08f);
-        Color leaves =
-            new(
-                0.10f + variant * 0.015f,
-                0.43f,
-                0.18f);
-
-        DrawRect(
-            new Rect2(
-                x - 6.0f,
-                y - height + 26.0f,
-                12.0f,
-                height - 26.0f),
-            trunk);
-
-        DrawCircle(
-            new Vector2(
-                x,
-                y - height + 18.0f),
-            26.0f,
-            leaves);
-
-        DrawCircle(
-            new Vector2(
-                x - 18.0f,
-                y - height + 28.0f),
-            19.0f,
-            leaves);
-
-        DrawCircle(
-            new Vector2(
-                x + 18.0f,
-                y - height + 28.0f),
-            19.0f,
-            leaves);
-    }
-
-    private void DrawPine(
-        float x,
-        float y,
-        int variant,
-        bool large)
-    {
-        float height =
-            (large ? 112.0f : 86.0f)
-            + variant * 5.0f;
-        Color trunk =
-            new(0.27f, 0.18f, 0.12f);
-        Color needles =
-            new(0.10f, 0.30f, 0.22f);
-
-        DrawRect(
-            new Rect2(
-                x - 5.0f,
-                y - height + 30.0f,
-                10.0f,
-                height - 30.0f),
-            trunk);
-
-        DrawCircle(
-            new Vector2(
-                x,
-                y - height + 22.0f),
-            19.0f,
-            needles);
-
-        DrawCircle(
-            new Vector2(
-                x,
-                y - height + 38.0f),
-            24.0f,
-            needles);
-
-        DrawCircle(
-            new Vector2(
-                x,
-                y - height + 56.0f),
-            29.0f,
-            needles);
-    }
-
-    private void DrawPalm(
-        float x,
-        float y,
-        int variant,
-        bool large)
-    {
-        float height =
-            (large ? 112.0f : 86.0f)
-            + variant * 5.0f;
-        Color trunk =
-            new(0.48f, 0.29f, 0.12f);
-        Color leaves =
-            new(0.08f, 0.46f, 0.20f);
-
-        Vector2 crown =
-            new(
-                x + 8.0f,
-                y - height);
-
-        DrawLine(
-            new Vector2(x, y),
-            crown,
-            trunk,
-            10.0f,
-            true);
-
-        DrawLine(
-            crown,
-            crown + new Vector2(-34.0f, -8.0f),
-            leaves,
-            9.0f,
-            true);
-
-        DrawLine(
-            crown,
-            crown + new Vector2(34.0f, -10.0f),
-            leaves,
-            9.0f,
-            true);
-
-        DrawLine(
-            crown,
-            crown + new Vector2(-24.0f, 10.0f),
-            leaves,
-            8.0f,
-            true);
-
-        DrawLine(
-            crown,
-            crown + new Vector2(25.0f, 11.0f),
-            leaves,
-            8.0f,
-            true);
-
-        DrawCircle(
-            crown + new Vector2(-5.0f, 8.0f),
-            4.0f,
-            new Color(0.42f, 0.24f, 0.09f));
-    }
-
-    private void DrawCactus(
-        float x,
-        float y,
-        int variant,
-        bool large)
-    {
-        float height =
-            (large ? 72.0f : 50.0f)
-            + variant * 5.0f;
-        Color cactus =
-            new(0.10f, 0.48f, 0.24f);
-
-        DrawLine(
-            new Vector2(x, y),
-            new Vector2(x, y - height),
-            cactus,
-            16.0f,
-            true);
-
-        DrawLine(
-            new Vector2(x, y - 25.0f),
-            new Vector2(x - 14.0f, y - 34.0f),
-            cactus,
-            10.0f,
-            true);
-
-        DrawLine(
-            new Vector2(x - 14.0f, y - 34.0f),
-            new Vector2(x - 14.0f, y - 45.0f),
-            cactus,
-            10.0f,
-            true);
-
-        if (variant > 0)
-        {
-            DrawLine(
-                new Vector2(x, y - 34.0f),
-                new Vector2(x + 14.0f, y - 42.0f),
-                cactus,
-                10.0f,
-                true);
-        }
-    }
-
-    private void DrawRock(
-        float x,
-        float y,
-        int variant)
-    {
-        float radius =
-            11.0f + variant * 3.0f;
-
-        Color rock =
-            _island.Biome == BiomeType.Snowy
-                ? new Color(
-                    0.67f,
-                    0.73f,
-                    0.79f)
-                : new Color(
-                    0.38f,
-                    0.40f,
-                    0.42f);
-
-        DrawCircle(
-            new Vector2(
-                x,
-                y - radius * 0.55f),
-            radius,
-            rock);
-
-        DrawRect(
-            new Rect2(
-                x - radius,
-                y - radius * 0.6f,
-                radius * 2.0f,
-                radius * 0.6f),
-            rock);
-    }
-
-    private void DrawFlower(
-        float x,
-        float y,
-        int variant)
-    {
-        Color[] petals =
-        {
-            new Color(0.95f, 0.20f, 0.18f),
-            new Color(0.95f, 0.80f, 0.15f),
-            new Color(0.20f, 0.40f, 0.95f),
-        };
-
-        DrawLine(
-            new Vector2(x, y),
-            new Vector2(x, y - 18.0f),
-            new Color(0.12f, 0.45f, 0.18f),
-            3.0f);
-
-        DrawCircle(
-            new Vector2(x, y - 20.0f),
-            6.0f,
-            petals[
-                Math.Abs(variant)
-                % petals.Length]);
-
-        DrawCircle(
-            new Vector2(x, y - 20.0f),
-            2.0f,
-            new Color(1.0f, 0.82f, 0.20f));
-    }
-
-    private void DrawGrass(
-        float x,
-        float y)
-    {
-        Color grass =
-            new(0.12f, 0.54f, 0.18f);
-
-        DrawLine(
-            new Vector2(x - 8.0f, y),
-            new Vector2(x - 3.0f, y - 20.0f),
-            grass,
-            3.0f);
-
-        DrawLine(
-            new Vector2(x, y),
-            new Vector2(x, y - 25.0f),
-            grass,
-            3.0f);
-
-        DrawLine(
-            new Vector2(x + 8.0f, y),
-            new Vector2(x + 3.0f, y - 19.0f),
-            grass,
-            3.0f);
-    }
-
-    private void DrawBush(
-        float x,
-        float y,
-        int variant)
-    {
-        Color bush =
-            new(
-                0.07f,
-                0.37f + variant * 0.03f,
-                0.13f);
-
-        DrawCircle(
-            new Vector2(x - 11.0f, y - 13.0f),
-            14.0f,
-            bush);
-
-        DrawCircle(
-            new Vector2(x + 10.0f, y - 14.0f),
-            15.0f,
-            bush);
-
-        DrawCircle(
-            new Vector2(x, y - 22.0f),
-            15.0f,
-            bush);
-    }
-
-    private void DrawMushroom(
-        float x,
-        float y,
-        int variant)
-    {
-        Color cap =
-            variant == 0
-                ? new Color(
-                    0.47f,
-                    0.24f,
-                    0.10f)
-                : new Color(
-                    0.80f,
-                    0.12f,
-                    0.12f);
-
-        DrawRect(
-            new Rect2(
-                x - 3.0f,
-                y - 12.0f,
-                6.0f,
-                12.0f),
-            new Color(0.90f, 0.83f, 0.66f));
-
-        DrawCircle(
-            new Vector2(x, y - 13.0f),
-            8.0f,
-            cap);
-
-        DrawRect(
-            new Rect2(
-                x - 8.0f,
-                y - 13.0f,
-                16.0f,
-                8.0f),
-            cap);
-    }
+    #endregion
 }

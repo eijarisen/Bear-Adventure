@@ -8,12 +8,24 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BearAdventure.Domain", "src
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BearAdventure.Persistence", "src\BearAdventure.Persistence\BearAdventure.Persistence.csproj", "{5A313F1D-7390-49A8-81F9-DAB5F9B6803F}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BearAdventure.Gameplay.Checks", "tests\BearAdventure.Gameplay.Checks\BearAdventure.Gameplay.Checks.csproj", "{B493BA01-C96E-4731-A223-EA9B28E074F3}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "BearAdventure.PixelArt.Checks", "tests\BearAdventure.PixelArt.Checks\BearAdventure.PixelArt.Checks.csproj", "{F3A5A5FC-9E61-46A5-A895-77FD1544E8F6}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{F3A5A5FC-9E61-46A5-A895-77FD1544E8F6}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{F3A5A5FC-9E61-46A5-A895-77FD1544E8F6}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{F3A5A5FC-9E61-46A5-A895-77FD1544E8F6}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{F3A5A5FC-9E61-46A5-A895-77FD1544E8F6}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B493BA01-C96E-4731-A223-EA9B28E074F3}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B493BA01-C96E-4731-A223-EA9B28E074F3}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B493BA01-C96E-4731-A223-EA9B28E074F3}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B493BA01-C96E-4731-A223-EA9B28E074F3}.Release|Any CPU.Build.0 = Release|Any CPU
 		{A6E3B4A8-3CA7-4E24-81EF-5F0D1CFDC3C8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{A6E3B4A8-3CA7-4E24-81EF-5F0D1CFDC3C8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A6E3B4A8-3CA7-4E24-81EF-5F0D1CFDC3C8}.Release|Any CPU.ActiveCfg = Release|Any CPU

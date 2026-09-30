@@ -88,17 +88,17 @@ public static class PlacedHarvestRules
                 wood *= 2;
             }
 
-            return
-            [
-                new HarvestReward(
-                    ItemType.Wood,
-                    wood),
-                new HarvestReward(
-                    ItemType.Sapling,
-                    diamond
-                        ? 2
-                        : 1),
-            ];
+            if (placed.PlantKind == NaturalFeatureKind.Cactus)
+            {
+                var rewards = new List<HarvestReward> { new(ItemType.Cactus, wood) };
+                if (placed.PlacementId % 100 == 0) rewards.Add(new(ItemType.PinkFlower, diamond ? 2 : 1));
+                return rewards;
+            }
+            var treeRewards = new List<HarvestReward> {
+                new(ItemType.Wood, wood), new(ItemType.Sapling, diamond ? 2 : 1) };
+            if (placed.PlantKind == NaturalFeatureKind.Palm && placed.PlacementId % 10 == 0)
+                treeRewards.Add(new(ItemType.Banana, diamond ? 2 : 1));
+            return treeRewards;
         }
 
         if (PlacementRules.IsFlower(placed.Item)
@@ -121,9 +121,7 @@ public static class PlacedHarvestRules
         ArgumentNullException.ThrowIfNull(placed);
 
         return placed.Item == ItemType.Sapling
-            ? (IsLargeMatureTree(placed)
-                ? "large planted tree"
-                : "small planted tree")
+            ? $"{(IsLargeMatureTree(placed) ? "large" : "small")} planted {HarvestRules.GetDisplayName(placed.PlantKind)}"
             : PlacementRules
                 .GetDisplayName(placed.Item)
                 .ToLowerInvariant();

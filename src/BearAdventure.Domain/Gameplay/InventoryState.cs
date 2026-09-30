@@ -1,78 +1,48 @@
+using System.Collections.ObjectModel;
+
 namespace BearAdventure.Domain.Gameplay;
 
 public sealed class InventoryState
 {
     private readonly Dictionary<ItemType, int> _counts = new();
-
-    public IReadOnlyDictionary<ItemType, int> Counts => _counts;
-
-    public int Get(ItemType item)
-    {
-        return _counts.TryGetValue(item, out int count) ? count : 0;
-    }
-
-    public bool Has(ItemType item, int amount = 1)
-    {
-        return amount > 0 && Get(item) >= amount;
-    }
+    private readonly ReadOnlyDictionary<ItemType, int> _view;
+    public InventoryState() { _view = new(_counts); }
+    public IReadOnlyDictionary<ItemType, int> Counts => _view;
+    public long Revision { get; private set; }
+    public int Get(ItemType item) => _counts.GetValueOrDefault(item);
+    public bool Has(ItemType item, int amount = 1) => amount > 0 && Get(item) >= amount;
+    public bool IsEmpty => _counts.Count == 0;
 
     public void Set(ItemType item, int amount)
     {
-        if (amount <= 0)
-        {
-            _counts.Remove(item);
-            return;
-        }
-
-        _counts[item] = amount;
+        if (!Enum.IsDefined(item)) throw new ArgumentOutOfRangeException(nameof(item));
+        if (amount < 0) throw new ArgumentOutOfRangeException(nameof(amount));
+        if (Get(item) == amount) return;
+        if (amount == 0) _counts.Remove(item); else _counts[item] = amount;
+        Revision++;
     }
-
-    public void Add(ItemType item, int amount)
-    {
-        if (amount == 0)
-        {
-            return;
-        }
-
-        int next = Get(item) + amount;
-        if (next < 0)
-        {
-            throw new InvalidOperationException(
-                $"Inventory operation would make {item} negative.");
-        }
-
-        Set(item, next);
-    }
-
-    public Dictionary<ItemType, int> Snapshot()
-    {
-        return new Dictionary<ItemType, int>(_counts);
-    }
-
+    public void Add(ItemType item, int amount) => Set(item, checked(Get(item) + amount));
+    public Dictionary<ItemType, int> Snapshot() => new(_counts);
     public void ReplaceWith(IEnumerable<KeyValuePair<ItemType, int>> items)
     {
         ArgumentNullException.ThrowIfNull(items);
-
-        _counts.Clear();
-
-        foreach ((ItemType item, int count) in items)
+        var next = new Dictionary<ItemType, int>();
+        foreach (var (item, count) in items)
         {
-            if (count > 0)
-            {
-                _counts[item] = count;
-            }
+            if (!Enum.IsDefined(item) || count < 0) throw new ArgumentException("Invalid inventory entry.");
+            if (count > 0) next.Add(item, count);
         }
+        // Validation happens before any mutation (including self-replacement).
+        _counts.Clear();
+        foreach (var entry in next) _counts.Add(entry.Key, entry.Value);
+        Revision++;
     }
+    public static InventoryState CreateNormalStarter() => ProgressionService.CreateNormalStarter();
 
     public static InventoryState CreateDevelopmentStarter()
     {
-        var inventory = new InventoryState();
-
-        // Temporary until crafting is implemented. This makes the first tool
-        // timing behavior testable without debug console commands.
-        inventory.Set(ItemType.Axe, 1);
-        inventory.Set(ItemType.Pickaxe, 1);
-
-        return inventory;
+        var result = new InventoryState();
+        result.Set(ItemType.Axe, 1); result.Set(ItemType.Pickaxe, 1);
+        return result;
     }
 }

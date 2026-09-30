@@ -1,0 +1,23 @@
+name: Build and regression checks
+on:
+  push:
+  pull_request:
+jobs:
+  dotnet-checks:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Compile and run gameplay/persistence/pixel checks
+        shell: bash
+        run: bash scripts/verify-gameplay.sh
+      - name: Keep toolchain and test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-logs
+          path: game/.godot/verification/
+# Native Godot collision/input checks are a separate local acceptance gate:
+# GODOT4=/path/to/your/current/Godot.NET.exe bash scripts/verify-gameplay.sh --require-engine

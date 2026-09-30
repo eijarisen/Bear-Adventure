@@ -1,301 +1,105 @@
+using System;
 using BearAdventure.Domain.World;
+using BearAdventure.Rendering.PixelArt;
 using Godot;
 
 namespace BearAdventure.Rendering;
 
+/// <summary>Pixel scenery only. Camera/physics, time and island state are never written here.</summary>
 public partial class ParallaxBackdrop : Control
 {
-    private BiomePalette _palette =
-        BiomePalette.For(BiomeType.Forest);
-
-    private BiomeType _biome =
-        BiomeType.Forest;
-
+    private BiomeType _biome = BiomeType.Forest;
     private int _islandId;
-    private float _cameraX;
-    private double _elapsedSeconds;
-    private Vector2 _lastViewportSize;
+    private float _fallbackCameraX;
+    private double _visualSeconds;
+    private Vector2 _screenCenter;
 
     public override void _Ready()
     {
-        MouseFilter =
-            MouseFilterEnum.Ignore;
-
+        MouseFilter = MouseFilterEnum.Ignore;
+        TextureFilter = TextureFilterEnum.Nearest;
         Position = Vector2.Zero;
-        _lastViewportSize =
-            GetViewportRect().Size;
-        Size = _lastViewportSize;
-
+        Size = GetViewportRect().Size;
         QueueRedraw();
     }
 
     public override void _Process(double delta)
     {
-        _elapsedSeconds += delta;
-
-        Vector2 viewportSize =
-            GetViewportRect().Size;
-
-        if (viewportSize != _lastViewportSize)
-        {
-            _lastViewportSize =
-                viewportSize;
-            Size =
-                viewportSize;
-        }
-
+        _visualSeconds += delta;
+        Vector2 size = GetViewportRect().Size;
+        if (Size != size) Size = size;
+        Camera2D? camera = GetViewport().GetCamera2D();
+        // Follow the actual smoothed, clamped camera, not an estimate from bear X.
+        _screenCenter = camera is not null ? camera.GetScreenCenterPosition() : new Vector2(_fallbackCameraX, -100);
         QueueRedraw();
     }
 
-    public void Configure(
-        BiomeType biome,
-        int islandId)
+    public void Configure(BiomeType biome, int islandId)
     {
         _biome = biome;
         _islandId = islandId;
-        _palette =
-            BiomePalette.For(biome);
-
         QueueRedraw();
     }
 
-    public void SetCameraX(float cameraX)
-    {
-        _cameraX = cameraX;
-    }
+    public void SetCameraX(float cameraX) => _fallbackCameraX = cameraX;
 
     public override void _Draw()
     {
-        Vector2 viewport =
-            GetViewportRect().Size;
-
-        if (viewport.X <= 0.0f
-            || viewport.Y <= 0.0f)
+        Vector2 view = GetViewportRect().Size;
+        if (view.X < 1 || view.Y < 1) return;
+        Color high = PixelAtlas.ToColor(Enum.Parse<PxColor>($"Sky{_biome}Top"));
+        Color low = PixelAtlas.ToColor(Enum.Parse<PxColor>($"Mist{_biome}"));
+        // Discrete bands, not smooth gradients or a screen-wide blur filter.
+        const int bands = 12;
+        for (int band = 0; band < bands; band++)
         {
-            return;
+            float top = Mathf.Floor(view.Y * band / bands);
+            float bottom = Mathf.Ceil(view.Y * (band + 1) / bands);
+            DrawRect(new Rect2(0, top, view.X, bottom - top), high.Lerp(low, band / (float)(bands - 1)));
         }
-
-        DrawRect(
-            new Rect2(
-                Vector2.Zero,
-                viewport),
-            _palette.Sky);
-
-        DrawCloudLayer(
-            viewport,
-            factor: 0.055f);
-
-        DrawHillLayer(
-            viewport,
-            Blend(
-                _palette.Distant,
-                _palette.Sky,
-                0.28f),
-            factor: 0.10f,
-            spacing: 500.0f,
-            radius: _biome == BiomeType.Mountain
-                ? 260.0f
-                : 210.0f,
-            baseline: viewport.Y * 0.62f,
-            salt: 83);
-
-        DrawHillLayer(
-            viewport,
-            _palette.Distant,
-            factor: 0.22f,
-            spacing: 390.0f,
-            radius: _biome == BiomeType.Mountain
-                ? 220.0f
-                : 175.0f,
-            baseline: viewport.Y * 0.72f,
-            salt: 211);
-
-        DrawHillLayer(
-            viewport,
-            Blend(
-                _palette.Distant,
-                _palette.Ground,
-                0.35f),
-            factor: 0.38f,
-            spacing: 310.0f,
-            radius: _biome == BiomeType.Mountain
-                ? 175.0f
-                : 135.0f,
-            baseline: viewport.Y * 0.82f,
-            salt: 347);
+        PixelAtlas.DrawBottom(this, "sun", new Vector2(view.X * 0.77f, view.Y * 0.27f), 2.0f,
+            modulate: new Color(1, 1, 1, _biome == BiomeType.Jungle ? 0.55f : 0.8f));
+        DrawClouds(view);
+        DrawLandscape(view, 0, 0.10f, 0.44f);
+        DrawLandscape(view, 1, 0.22f, 0.50f);
+        DrawLandscape(view, 2, 0.38f, 0.57f);
     }
 
-    private void DrawCloudLayer(
-        Vector2 viewport,
-        float factor)
+    private void DrawLandscape(Vector2 viewport, int layer, float factor, float screenBaseline)
     {
-        Color cloud =
-            _biome == BiomeType.Jungle
-                ? new Color(
-                    0.75f,
-                    0.84f,
-                    0.76f,
-                    0.22f)
-                : new Color(
-                    1.0f,
-                    1.0f,
-                    1.0f,
-                    0.30f);
-
-        float spacing =
-            430.0f;
-
-        float drift =
-            (float)(_elapsedSeconds * 6.0);
-
-        float scroll =
-            PositiveModulo(
-                _cameraX * factor
-                - drift
-                + IslandPhase(149),
-                spacing);
-
-        for (float x = -spacing - scroll;
-             x < viewport.X + spacing;
-             x += spacing)
+        string key = $"landscape/{_biome}/{layer}";
+        Texture2D strip = PixelAtlas.Get(key);
+        float width = strip.GetWidth() * 2.0f;
+        float height = strip.GetHeight() * 2.0f;
+        // Modulo moves fixed silhouettes; it never changes an individual hill's size.
+        float phase = PixelAtlas.Variant(_islandId, layer, 384);
+        float offset = Mathf.PosMod(_screenCenter.X * factor + phase, width);
+        float top = Mathf.Floor(viewport.Y * screenBaseline - 150 - (_screenCenter.Y + 100) * factor);
+        for (float x = -width - offset; x < viewport.X + width; x += width)
+            PixelAtlas.DrawRect(this, key, new Rect2(Mathf.Floor(x), top, width, height));
+        // Fill only BELOW the silhouette's bottom; never paint over the hills.
+        float bottom = top + height;
+        if (bottom < viewport.Y)
         {
-            float y =
-                90.0f
-                + PositiveModulo(
-                    x * 0.13f
-                    + IslandPhase(29),
-                    95.0f);
-
-            DrawCircle(
-                new Vector2(x, y),
-                24.0f,
-                cloud);
-            DrawCircle(
-                new Vector2(x + 23.0f, y - 9.0f),
-                31.0f,
-                cloud);
-            DrawCircle(
-                new Vector2(x + 53.0f, y),
-                25.0f,
-                cloud);
+            PxColor fill = Enum.Parse<PxColor>($"{(layer == 0 ? "Far" : layer == 1 ? "Mid" : "Near")}{_biome}");
+            DrawRect(new Rect2(0, bottom, viewport.X, viewport.Y - bottom), PixelAtlas.ToColor(fill));
         }
     }
 
-    private void DrawHillLayer(
-        Vector2 viewport,
-        Color color,
-        float factor,
-        float spacing,
-        float radius,
-        float baseline,
-        int salt)
+    private void DrawClouds(Vector2 viewport)
     {
-        float scroll =
-            PositiveModulo(
-                _cameraX * factor
-                + IslandPhase(salt),
-                spacing);
-
-        for (float x = -spacing - scroll;
-             x < viewport.X + spacing;
-             x += spacing)
+        const float spacing = 320.0f;
+        float drift = (float)(_visualSeconds % 3600.0) * 4.0f;
+        float scroll = _screenCenter.X * 0.055f - drift;
+        int first = Mathf.FloorToInt(scroll / spacing) - 1;
+        int count = Mathf.CeilToInt(viewport.X / spacing) + 3;
+        for (int n = first; n < first + count; n++)
         {
-            float radiusVariation =
-                PositiveModulo(
-                    x * 0.17f
-                    + IslandPhase(salt + 17),
-                    48.0f)
-                - 24.0f;
-
-            float r =
-                Math.Max(
-                    70.0f,
-                    radius + radiusVariation);
-
-            DrawCircle(
-                new Vector2(
-                    x + spacing * 0.5f,
-                    baseline + r),
-                r,
-                color);
+            int variant = PixelAtlas.Variant(n, _islandId, 3);
+            float x = n * spacing - scroll;
+            float y = 100 + PixelAtlas.Variant(n, _islandId + 149, 75) - (_screenCenter.Y + 100) * 0.025f;
+            PixelAtlas.DrawBottom(this, $"cloud/{variant}", new Vector2(Mathf.Floor(x), Mathf.Floor(y)), 2.0f,
+                modulate: new Color(1, 1, 1, 0.75f));
         }
-
-        DrawRect(
-            new Rect2(
-                0.0f,
-                baseline,
-                viewport.X,
-                Math.Max(
-                    0.0f,
-                    viewport.Y - baseline)),
-            color);
-    }
-
-    private float IslandPhase(int salt)
-    {
-        unchecked
-        {
-            int value =
-                (_islandId * 73856093)
-                ^ (salt * 19349663);
-
-            return PositiveModulo(
-                value,
-                10_000);
-        }
-    }
-
-    private static Color Blend(
-        Color from,
-        Color to,
-        float amount)
-    {
-        amount =
-            Mathf.Clamp(
-                amount,
-                0.0f,
-                1.0f);
-
-        return new Color(
-            Mathf.Lerp(
-                from.R,
-                to.R,
-                amount),
-            Mathf.Lerp(
-                from.G,
-                to.G,
-                amount),
-            Mathf.Lerp(
-                from.B,
-                to.B,
-                amount),
-            Mathf.Lerp(
-                from.A,
-                to.A,
-                amount));
-    }
-
-    private static float PositiveModulo(
-        float value,
-        float modulus)
-    {
-        float result =
-            value % modulus;
-
-        return result < 0.0f
-            ? result + modulus
-            : result;
-    }
-
-    private static float PositiveModulo(
-        int value,
-        int modulus)
-    {
-        int result =
-            value % modulus;
-
-        return result < 0
-            ? result + modulus
-            : result;
     }
 }

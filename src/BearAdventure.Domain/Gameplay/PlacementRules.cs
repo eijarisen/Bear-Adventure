@@ -80,6 +80,7 @@ public static class PlacementRules
             ItemType.DiamondAxe => "Diamond Axe",
             ItemType.DiamondPickaxe => "Diamond Pickaxe",
             ItemType.GoldCoin => "Gold Coin",
+            ItemType.FishingRod => "Fishing Rod",
             _ => item.ToString(),
         };
     }

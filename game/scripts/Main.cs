@@ -5,577 +5,649 @@ using BearAdventure.Interaction;
 using BearAdventure.Persistence;
 using BearAdventure.Player;
 using BearAdventure.Rendering;
+using BearAdventure.Shell;
 using BearAdventure.UI;
 using BearAdventure.World;
 using Godot;
+using IOFile = System.IO.File;
 
 namespace BearAdventure;
 
 public partial class Main : Node2D
 {
-    private const string DevelopmentWorldSeed =
-        "bear-adventure-development-001";
-    private const string SaveFileName =
-        "bear-adventure-save.json";
-
-    private readonly IslandGenerator _islandGenerator =
-        new();
-    private readonly WorldSeed _worldSeed =
-        new(DevelopmentWorldSeed);
-    private readonly SaveGameStore _saveStore =
-        new();
-    private readonly WorldSimulationService _worldSimulation =
-        new();
-
-    private GameSessionState _session =
-        GameSessionState.CreateDevelopmentStarter();
-
-    private IslandView? _islandView;
-    private BearController? _player;
-    private HarvestController? _harvestController;
-    private BuildingController? _buildingController;
-    private GameHud? _hud;
-    private CanvasLayer? _parallaxLayer;
-    private ParallaxBackdrop? _parallaxBackdrop;
-
-    private double _simulationAccumulator;
-    private double _autosaveAccumulator;
+    private const string DefaultSeed="bear-adventure-development-001";
+    private readonly IslandGenerator _generator=new();
+    private readonly SaveGameStore _saves=new();
+    private readonly WorldSimulationService _simulation=new();
+    private readonly GameSettingsStore _settingsStore=new();
+    private GameSessionState? _session;
+    private IslandView? _island;
+    private BearController _bear=null!;
+    private HarvestController _harvest=null!;
+    private BuildingController _building=null!;
+    private GameHud _hud=null!;
+    private GameplayInput _input=null!;
+    private ParallaxBackdrop _backdrop=null!;
+    private GameShell _shell=null!;
+    private FeedbackAudio _audio=null!;
+    private SaveSlotService _slots=null!;
+    private GameSettings _settings=new();
+    private bool _saveAllowed, _dirty, _quitting;
+    private double _autosave, _saveDelay=-1;
+    private string _savePath="";
+    private string _originalPath="";
+    private string _selectorPath="";
+    private string _settingsPath="";
 
     public override void _Ready()
     {
-        LoadSession();
-
-        _parallaxLayer =
-            new CanvasLayer
-            {
-                Name = "ParallaxLayer",
-                Layer = -100,
-            };
-        AddChild(_parallaxLayer);
-
-        _parallaxBackdrop =
-            new ParallaxBackdrop
-            {
-                Name = "ParallaxBackdrop",
-            };
-        _parallaxLayer.AddChild(
-            _parallaxBackdrop);
-
-        _hud = new GameHud
-        {
-            Name = "Hud",
-        };
-        AddChild(_hud);
-        _hud.ConfigureInventory(
-            _session.Inventory);
-
-        _player = new BearController
-        {
-            Name = "Bear",
-        };
-        AddChild(_player);
-
-        _harvestController =
-            new HarvestController
-            {
-                Name = "HarvestController",
-            };
-        AddChild(_harvestController);
-
-        _buildingController =
-            new BuildingController
-            {
-                Name = "BuildingController",
-            };
-        AddChild(_buildingController);
-
-        _harvestController.StatusChanged +=
-            OnHarvestStatusChanged;
-        _harvestController.HarvestCompleted +=
-            OnHarvestCompleted;
-        _harvestController.StationRequested +=
-            OnStationRequested;
-        _harvestController.TravelRequested +=
-            OnTravelRequested;
-
-        _buildingController.StatusMessage +=
-            OnBuildingNotification;
-        _buildingController.InventoryChanged +=
-            OnInventoryChanged;
-        _buildingController.IslandChanged +=
-            OnIslandChanged;
-        _buildingController.SelectionChanged +=
-            OnBuildSelectionChanged;
-
-        _hud.PlaceableItemSelected +=
-            OnPlaceableItemSelected;
-        _hud.CraftRequested +=
-            OnCraftRequested;
-        _hud.StationCraftRequested +=
-            OnStationCraftRequested;
-
-        LoadIsland(
-            _session.CurrentIslandId);
-
-        _hud.ShowNotification(
-            "Underground mining and generated structures are active.");
+        ProcessMode=ProcessModeEnum.Always;
+        ProcessPhysicsPriority=-100;
+        GetTree().AutoAcceptQuit=false;
+        _originalPath=ProjectSettings.GlobalizePath("user://bear-adventure-save.json");
+        _selectorPath=ProjectSettings.GlobalizePath("user://bear-adventure-selected-save.txt");
+        _settingsPath=ProjectSettings.GlobalizePath("user://bear-adventure-settings.json");
+        _settings=_settingsStore.Load(_settingsPath);
+        _slots=new SaveSlotService(Path.GetDirectoryName(_originalPath)!);
+        ImportLegacyRecoverySelection();
+        _savePath=_slots.PathForSlot(_settings.LastSlot);
+        var layer=new CanvasLayer {Name="ParallaxLayer",Layer=-100,ProcessMode=ProcessModeEnum.Pausable}; AddChild(layer);
+        _backdrop=new ParallaxBackdrop {Name="ParallaxBackdrop",ProcessMode=ProcessModeEnum.Pausable}; layer.AddChild(_backdrop);
+        _hud=new GameHud {Name="Hud"}; AddChild(_hud);
+        _shell=new GameShell {Name="GameShell"}; AddChild(_shell);
+        _audio=new FeedbackAudio {Name="FeedbackAudio"}; AddChild(_audio);
+        _bear=new BearController {Name="Bear",ProcessMode=ProcessModeEnum.Pausable,Visible=false}; AddChild(_bear);
+        _harvest=new HarvestController {Name="HarvestController",ProcessMode=ProcessModeEnum.Pausable,ProcessPhysicsPriority=-50}; AddChild(_harvest);
+        _building=new BuildingController {Name="BuildingController",ProcessMode=ProcessModeEnum.Pausable,ProcessPhysicsPriority=-40}; AddChild(_building);
+        // Added last: it observes releases and menu keys before GUI/gameplay input dispatch.
+        _input=new GameplayInput {Name="GameplayInput"}; AddChild(_input);
+        _input.ApplyBindings(_settings);
+        _bear.InputState=_input.State;
+        _harvest.BuildingSelected=()=>_building.SelectedItem.HasValue;
+        _input.MenuRequested+=_hud.HandleMenu;
+        _input.Cancelled+=CancelTransientActions;
+        _input.FocusLost+=()=>{if(_session is not null && !_hud.AnyPanelOpen) _hud.ShowPause("Window lost focus.");};
+        _hud.ModalChanged+=_input.SetModal;
+        _hud.PlaceableItemSelected+=_building.SelectItem;
+        _hud.ConfigureResidentProvider(()=>_session?.Residents ?? Array.Empty<ResidentState>());
+        _hud.ConfigureMapProvider(BuildMapEntries);
+        _hud.CraftRequested+=Craft;
+        _hud.StationCraftRequested+=CraftAtStation;
+        _hud.TransferRequested+=Transfer;
+        _hud.TradeRequested+=TradeWithResident;
+        _hud.InviteResidentRequested+=InviteResident;
+        _hud.SpecialRewardRequested+=ClaimSpecialReward;
+        _hud.PlaceFriendRequested+=PlaceFriend;
+        _hud.OpenWorkerRequested+=OpenWorker;
+        _hud.WorkerAssignChestRequested+=AssignWorkerChest;
+        _hud.WorkerPriorityRequested+=CycleWorkerPriority;
+        _hud.WorkerRadiusRequested+=SetWorkerRadius;
+        _hud.WorkerProtectionRequested+=ToggleWorkerProtection;
+        _hud.WorkerRecallRequested+=RecallWorker;
+        _hud.WorkerStopRequested+=StopWorker;
+        _hud.MapTravelRequested+=QueueMapTravel;
+        _hud.RetryLoadRequested+=()=>Callable.From(()=>LoadSession()).CallDeferred();
+        _hud.SeparateWorldRequested+=()=>Callable.From(StartSeparateWorld).CallDeferred();
+        _hud.QuitRequested+=RequestQuit;
+        _hud.SettingsRequested+=()=>_shell.ShowSettings(false);
+        _hud.ReturnToTitleRequested+=ReturnToTitle;
+        _hud.FeedbackRequested+=()=>_audio.PlayNotice();
+        _harvest.StatusChanged+=_hud.SetInteractionText;
+        _harvest.Changed+=message=>{Changed(); _hud.ShowNotification(message);};
+        _harvest.OpenEntityRequested+=OpenEntity;
+        _harvest.OpenResidentRequested+=OpenResident;
+        _harvest.SpecialChestRequested+=ClaimSpecialRewardWorld;
+        _harvest.TravelRequested+=QueueTravel;
+        _building.StatusMessage+=_hud.ShowNotification;
+        _building.Changed+=Changed;
+        _building.SelectionChanged+=_hud.SetBuildSelection;
+        _input.BindingChanged+=(id,key)=>{_settings.SetKey(id,key); SaveSettings(); _shell.NotifyBindingChanged(); UpdateControlsText();};
+        _shell.Configure(BuildSlotSummaries,()=>_settings);
+        _shell.ContinueRequested+=LoadSlot;
+        _shell.LoadSlotRequested+=LoadSlot;
+        _shell.NewGameRequested+=StartNewWorld;
+        _shell.ResetSlotRequested+=ResetSlot;
+        _shell.SettingsChanged+=ApplySettings;
+        _shell.RebindRequested+=_input.BeginRebind;
+        _shell.QuitRequested+=RequestQuit;
+        ApplySettings(_settings);
+        _hud.SetHudVisible(false);
+        _input.SetLoading(true);
+        _shell.ShowTitle();
+        UpdateControlsText();
+        GD.Print($"Bear Adventure build {GameHud.BuildId}; save schema {GameSaveData.CurrentFormatVersion}; Godot {Engine.GetVersionInfo()["string"]}");
     }
-
-    public override void _PhysicsProcess(double delta)
-    {
-        _ = delta;
-
-        if (_player is null
-            || _islandView is null)
-        {
-            return;
-        }
-
-        _player.ClimbEnabled =
-            _islandView.IsInMineShaft(
-                _player.Position);
-
-        if (_harvestController is not null)
-        {
-            _harvestController.MiningBlocked =
-                _buildingController?.SelectedItem is not null
-                || (_hud?.AnyPanelOpen ?? false);
-        }
-    }
-
-    public override void _Process(double delta)
-    {
-        UpdateParallaxCamera();
-
-        _simulationAccumulator += delta;
-        _autosaveAccumulator += delta;
-
-        if (_simulationAccumulator >= 0.5)
-        {
-            bool changed =
-                _worldSimulation.Advance(
-                    _session,
-                    _worldSeed,
-                    _islandGenerator,
-                    _simulationAccumulator);
-
-            _simulationAccumulator = 0.0;
-
-            if (changed)
-            {
-                _islandView?.QueueRedraw();
-                UpdateIslandHud();
-            }
-        }
-
-        if (_autosaveAccumulator >= 10.0)
-        {
-            _autosaveAccumulator = 0.0;
-            SaveSession();
-        }
-
-    }
-
-    public override void _ExitTree()
-    {
-        SaveSession();
-    }
-
-    private void LoadIsland(
-        int islandId,
-        BoatSide? arrivalSide = null)
-    {
-        _harvestController?.DetachIsland();
-        _buildingController?.DetachIsland();
-
-        _session.CurrentIslandId =
-            islandId;
-
-        if (_islandView is not null)
-        {
-            RemoveChild(_islandView);
-            _islandView.QueueFree();
-            _islandView = null;
-        }
-
-        IslandDefinition definition =
-            _islandGenerator.Generate(
-                _worldSeed,
-                islandId);
-
-        IslandDeltaState islandState =
-            _session.GetIslandState(
-                islandId);
-
-        _islandView =
-            new IslandView(
-                definition,
-                islandState)
-            {
-                Name = $"Island_{islandId}",
-            };
-
-        AddChild(_islandView);
-        MoveChild(_islandView, 0);
-
-        RenderingServer.SetDefaultClearColor(
-            _islandView.SkyColor);
-
-        _parallaxBackdrop?.Configure(
-            definition.Biome,
-            islandId);
-
-        Vector2 spawn =
-            arrivalSide is null
-                ? _islandView
-                    .GetSuggestedSpawnPosition()
-                : _islandView
-                    .GetBoatArrivalSpawn(
-                        arrivalSide.Value);
-
-        _player!.ConfigureIsland(
-            _islandView.LandLeftX,
-            _islandView.LandRightX,
-            spawn);
-
-        _player.ConfigureCamera(
-            0.0f,
-            _islandView.WorldWidth,
-            _islandView.WorldTop,
-            _islandView.WorldBottom);
-
-        _harvestController!.Configure(
-            _player,
-            _islandView,
-            _session.Inventory);
-
-        _buildingController!.Configure(
-            _player,
-            _islandView,
-            _session.Inventory);
-
-        _hud!.SetBuildSelection(
-            _buildingController.SelectedItem,
-            _buildingController.Layer);
-
-        UpdateIslandHud();
-        UpdateMapHud();
-        _hud.RefreshInventory();
-        SaveSession();
-    }
-
-    private void OnHarvestStatusChanged(
-        string text)
-    {
-        _hud?.SetInteractionText(text);
-    }
-
-    private void OnHarvestCompleted(
-        string message)
-    {
-        _hud?.RefreshInventory();
-        _hud?.ShowNotification(message);
-        UpdateIslandHud();
-        SaveSession();
-    }
-
-    private void OnPlaceableItemSelected(
-        ItemType item)
-    {
-        _buildingController?.SelectItem(item);
-    }
-
-    private void OnCraftRequested(
-        string recipeId)
-    {
-        CraftingRecipe? recipe =
-            CraftingCatalog.Find(recipeId);
-
-        if (recipe is null)
-        {
-            _hud?.ShowNotification(
-                "Unknown crafting recipe.");
-            return;
-        }
-
-        if (!CraftingService.TryCraft(
-            _session.Inventory,
-            recipe))
-        {
-            _hud?.ShowNotification(
-                "Not enough materials.");
-            return;
-        }
-
-        _hud?.RefreshInventory();
-        _hud?.ShowNotification(
-            $"Crafted {recipe.DisplayName}.");
-        SaveSession();
-    }
-
-    private void OnTravelRequested(
-        BoatSide departureSide)
-    {
-        int direction =
-            (int)departureSide;
-
-        int destinationId =
-            _session.CurrentIslandId
-            + direction;
-
-        BoatSide arrivalSide =
-            departureSide == BoatSide.Left
-                ? BoatSide.Right
-                : BoatSide.Left;
-
-        IslandDeltaState destinationState =
-            _session.GetIslandState(
-                destinationId);
-
-        // The boat used for the trip is also the arrival vessel, so the
-        // opposite shore becomes a usable return point immediately.
-        destinationState.SetBoatBuilt(
-            arrivalSide,
-            true);
-
-        _session.DiscoverIsland(
-            destinationId);
-
-        LoadIsland(
-            destinationId,
-            arrivalSide);
-
-        _hud?.ShowNotification(
-            $"Discovered island {destinationId}.");
-    }
-
-    private void OnStationRequested(
-        ItemType station)
-    {
-        _hud?.OpenStation(station);
-    }
-
-    private void OnStationCraftRequested(
-        ItemType station,
-        string recipeId)
-    {
-        if (!StationCraftingService.TryCraft(
-            _session.Inventory,
-            station,
-            recipeId))
-        {
-            _hud?.ShowNotification(
-                "Not enough materials.");
-            return;
-        }
-
-        StationRecipeDefinition? recipe =
-            StationCraftingService
-                .GetRecipes(station)
-                .FirstOrDefault(
-                    item =>
-                        item.Id == recipeId);
-
-        _hud?.RefreshInventory();
-        _hud?.ShowNotification(
-            $"Made {recipe?.DisplayName ?? "item"}.");
-        SaveSession();
-    }
-
-    private void OnBuildingNotification(
-        string message)
-    {
-        _hud?.ShowNotification(message);
-    }
-
-    private void OnInventoryChanged()
-    {
-        _hud?.RefreshInventory();
-        SaveSession();
-    }
-
-    private void OnIslandChanged()
-    {
-        UpdateIslandHud();
-        SaveSession();
-    }
-
-    private void OnBuildSelectionChanged(
-        ItemType? item,
-        BuildLayer layer)
-    {
-        _hud?.SetBuildSelection(
-            item,
-            layer);
-    }
-
-    private void UpdateParallaxCamera()
-    {
-        if (_parallaxBackdrop is null
-            || _player is null
-            || _islandView is null)
-        {
-            return;
-        }
-
-        float viewportWidth =
-            GetViewportRect().Size.X;
-
-        float halfViewport =
-            viewportWidth * 0.5f;
-
-        float minimumCenter =
-            halfViewport;
-
-        float maximumCenter =
-            Math.Max(
-                minimumCenter,
-                _islandView.WorldWidth
-                - halfViewport);
-
-        float cameraCenterX =
-            Mathf.Clamp(
-                _player.Position.X,
-                minimumCenter,
-                maximumCenter);
-
-        _parallaxBackdrop.SetCameraX(
-            cameraCenterX);
-    }
-
-    private void UpdateIslandHud()
-    {
-        if (_hud is null
-            || _islandView is null)
-        {
-            return;
-        }
-
-        _hud.SetIslandInfo(
-            DevelopmentWorldSeed,
-            _islandView.Definition,
-            _islandView
-                .RemainingNaturalFeatureCount);
-    }
-
-    private void UpdateMapHud()
-    {
-        if (_hud is null)
-        {
-            return;
-        }
-
-        var lines =
-            new List<string>
-            {
-                "Discovered islands",
-                string.Empty,
-            };
-
-        foreach (int islandId
-                 in _session.DiscoveredIslandIds
-                     .OrderBy(id => id))
-        {
-            IslandDefinition definition =
-                _islandGenerator.Generate(
-                    _worldSeed,
-                    islandId);
-
-            string marker =
-                islandId == _session.CurrentIslandId
-                    ? "  < HERE"
-                    : string.Empty;
-
-            lines.Add(
-                $"{islandId,5}   " +
-                $"{definition.Biome.ToString().ToUpperInvariant(),-10}" +
-                marker);
-        }
-
-        lines.Add(string.Empty);
-        lines.Add(
-            "Build boats at island edges to discover adjacent islands.");
-
-        _hud.SetMapText(
-            string.Join(
-                System.Environment.NewLine,
-                lines));
-    }
-
-    private void LoadSession()
-    {
-        string savePath =
-            GetSavePath();
-
-        GameSaveData? save =
-            _saveStore.Load(
-                savePath,
-                out string? warning);
-
-        if (save is null)
-        {
-            _session =
-                GameSessionState
-                    .CreateDevelopmentStarter();
-
-            if (!string.IsNullOrWhiteSpace(warning))
-            {
-                GD.PushWarning(warning);
-            }
-
-            return;
-        }
-
-        if (!string.Equals(
-            save.WorldSeed,
-            DevelopmentWorldSeed,
-            StringComparison.Ordinal))
-        {
-            GD.PushWarning(
-                "Save world seed does not match the current development seed. " +
-                "Starting a new session instead.");
-
-            _session =
-                GameSessionState
-                    .CreateDevelopmentStarter();
-            return;
-        }
-
-        _session =
-            save.ToSession();
-
-        if (!string.IsNullOrWhiteSpace(warning))
-        {
-            GD.PushWarning(warning);
-        }
-    }
-
-    private void SaveSession()
+    private void ImportLegacyRecoverySelection()
     {
         try
         {
-            GameSaveData save =
-                GameSaveData.FromSession(
-                    DevelopmentWorldSeed,
-                    _session);
-
-            _saveStore.Save(
-                GetSavePath(),
-                save);
+            string legacy=SelectedSavePath(); if(legacy==_originalPath || !IOFile.Exists(legacy)) return;
+            int slot=Enumerable.Range(2,2).FirstOrDefault(_slots.IsEmpty); if(slot==0) return;
+            string target=_slots.PathForSlot(slot); IOFile.Copy(legacy,target,false);
+            if(IOFile.Exists(legacy+".bak")) IOFile.Copy(legacy+".bak",target+".bak",false);
+            _settings.LastSlot=slot; SaveSettings();
         }
-        catch (Exception exception)
-        {
-            GD.PushError(
-                $"Could not save Bear Adventure: {exception}");
-
-            _hud?.ShowNotification(
-                "Save failed. See Godot output.");
-        }
+        catch(Exception e) when(e is IOException or UnauthorizedAccessException) { GD.PushWarning("Legacy recovery world was not imported into a slot: "+e.Message); }
     }
-
-    private static string GetSavePath()
+    private IReadOnlyList<SaveSlotSummary> BuildSlotSummaries() => _slots.InspectAll(_saves);
+    private void LoadSlot(int slot)
     {
-        return ProjectSettings.GlobalizePath(
-            $"user://{SaveFileName}");
+        try { _settings.LastSlot=slot; SaveSettings(); _savePath=_slots.PathForSlot(slot); LoadSession(); }
+        catch(Exception e) { _hud.ShowLoadError(e.Message); }
     }
+    private void StartNewWorld(int slot,string seed)
+    {
+        _input.SetLoading(true); _saveAllowed=false;
+        try
+        {
+            if(!_slots.IsEmpty(slot)) { _shell.ShowTitle(); return; }
+            seed=new WorldSeed(seed).Value;
+            _settings.LastSlot=slot; SaveSettings(); _savePath=_slots.PathForSlot(slot);
+            StartSession(GameSessionState.CreateNormalStarter(seed));
+            _saveAllowed=true; _dirty=true;
+            if(!SaveSession()) throw new IOException("Could not write the new world save.");
+            _hud.SetHudVisible(true); _shell.HideShell(); _input.SetLoading(false);
+            _hud.ShowNotification("New world created. "+ProgressionService.GetContextHint(_session!,_island!.Definition));
+        }
+        catch(Exception e)
+        { GD.PushError(e.ToString()); _saveAllowed=false; _hud.SetHudVisible(false); _input.SetLoading(true); _shell.ShowTitle(); }
+    }
+    private void ResetSlot(int slot)
+    {
+        try { _slots.Reset(slot); if(_settings.LastSlot==slot){_settings.LastSlot=1;SaveSettings();} }
+        catch(Exception e){ GD.PushError(e.ToString()); }
+    }
+    private void ReturnToTitle()
+    {
+        if(_saveAllowed && !SaveSession()) { _hud.ShowPause("Save failed. Previous save was retained."); return; }
+        CancelTransientActions(); _saveAllowed=false; _session=null;
+        if(_island is not null){ RemoveChild(_island); _island.QueueFree(); _island=null; }
+        _hud.CloseForTransition(); _hud.SetHudVisible(false); _bear.Visible=false; _input.SetLoading(true); _shell.ShowTitle();
+    }
+    private void SaveSettings()
+    {
+        try { _settingsStore.Save(_settingsPath,_settings); } catch(Exception e){ GD.PushWarning("Settings could not be saved: "+e.Message); }
+    }
+    private void ApplySettings(GameSettings settings)
+    {
+        _settings=settings; _settings.Normalize();
+        DisplayServer.WindowSetMode(_settings.Fullscreen?DisplayServer.WindowMode.Fullscreen:DisplayServer.WindowMode.Windowed);
+        if(!_settings.Fullscreen) DisplayServer.WindowSetSize(new Vector2I(1280,720));
+        _hud.ApplyUiScale(_settings.UiScale); _shell.ApplyUiScale(_settings.UiScale); _audio.Enabled=_settings.SoundEnabled;
+        _input.ApplyBindings(_settings); SaveSettings(); UpdateControlsText();
+    }
+    private void UpdateControlsText()
+    {
+        if(_hud is null) return;
+        _hud.SetControlsText($"{_settings.KeyFor(BindingId.Left)}/{_settings.KeyFor(BindingId.Right)} walk · {_settings.KeyFor(BindingId.Jump)} jump · {_settings.KeyFor(BindingId.Harvest)} harvest/mine · {_settings.KeyFor(BindingId.Use)} use · {_settings.KeyFor(BindingId.Fish)} fish\n{_settings.KeyFor(BindingId.Inventory)} inventory · {_settings.KeyFor(BindingId.Crafting)} craft · {_settings.KeyFor(BindingId.Map)} map · {_settings.KeyFor(BindingId.Friends)} friends · Esc pause/close · left/right mouse build/remove");
+    }
+
+    private string SelectedSavePath()
+    {
+        try
+        {
+            if(IOFile.Exists(_selectorPath))
+            {
+                string name=IOFile.ReadAllText(_selectorPath).Trim();
+                if(name==Path.GetFileName(name) && name.StartsWith("bear-adventure-recovery-world-",StringComparison.Ordinal) && name.EndsWith(".json",StringComparison.Ordinal))
+                {
+                    string path=Path.Combine(Path.GetDirectoryName(_originalPath)!,name);
+                    if(IOFile.Exists(path)) return path;
+                }
+            }
+        }
+        catch(Exception e) when(e is IOException or UnauthorizedAccessException) { GD.PushWarning(e.Message); }
+        return _originalPath;
+    }
+    private void LoadSession()
+    {
+        _input.SetLoading(true); _saveAllowed=false;
+        try
+        {
+            var result=_saves.LoadSession(_savePath);
+            if(result.Status==SaveLoadStatus.Failed)
+            { _hud.SetHudVisible(true); _shell.HideShell(); _input.SetLoading(false); _hud.ShowLoadError(result.Message); return; }
+            var candidate=result.Session ?? GameSessionState.CreateNormalStarter(DefaultSeed);
+            StartSession(candidate);
+            _saveAllowed=true;
+            _hud.CloseForTransition();
+            _hud.SetHudVisible(true);
+            _shell.HideShell();
+            _input.SetLoading(false);
+            _hud.ShowNotification($"Build {GameHud.BuildId}. "+result.Message);
+            GD.Print("Save path: "+_savePath);
+            if(_savePath==_originalPath && IOFile.Exists(_selectorPath)) IOFile.Delete(_selectorPath);
+        }
+        catch(Exception e)
+        { GD.PushError(e.ToString()); _hud.SetHudVisible(true); _shell.HideShell(); _input.SetLoading(false); _hud.ShowLoadError("World could not be prepared. Existing saves were not changed.\n"+e.Message); }
+    }
+    private void StartSession(GameSessionState candidate)
+    {
+        var d=candidate.GetDefinition(candidate.CurrentIslandId,_generator);
+        ResidentService.EnsureForIsland(candidate,d);
+        var state=candidate.GetIslandState(candidate.CurrentIslandId);
+        var queries=new WorldQueries(d,state);
+        var spawn=queries.SafeSpawn();
+        if(candidate.PlayerLocation is { } location && location.IslandId==candidate.CurrentIslandId && queries.FreeForBear(new(location.X,location.Y)))
+            spawn=new(location.X,location.Y);
+        var staged=new IslandView(d,state,candidate.Residents) {Name=$"Island_{d.IslandId}"};
+        try { staged.PreparePhysics(); AddChild(staged); }
+        catch { if(staged.GetParent() is not null) RemoveChild(staged); staged.QueueFree(); throw; }
+        var previous=_island;
+        _session=candidate; _island=staged;
+        BindWorld(staged,spawn);
+        if(previous is not null) { RemoveChild(previous); previous.QueueFree(); }
+        _dirty=false; _autosave=0; _saveDelay=-1;
+        UpdateHud(); UpdateMap();
+    }
+    private void BindWorld(IslandView view,WorldPoint spawn)
+    {
+        _bear.Visible=true;
+        _bear.SafeRespawn=()=>view.GetSuggestedSpawnPosition();
+        _bear.ConfigureIsland(view.LandLeftX,view.LandRightX,view.GetSuggestedSpawnPosition());
+        _bear.ConfigureCamera(0,view.WorldWidth,view.WorldTop,view.WorldBottom);
+        _bear.PlaceAt(IslandView.Vector(spawn));
+        _bear.ClimbEnabled=view.Queries.IsLadder(spawn);
+        _harvest.Configure(_bear,view,_session!.Inventory,_input.State,_session);
+        _building.Configure(_bear,view,_session.Inventory,_input.State);
+        _hud.ConfigureInventory(_session.Inventory);
+        _hud.SetBuildSelection(_building.SelectedItem,_building.Layer);
+        _backdrop.Configure(view.Definition.Biome,view.Definition.IslandId);
+        RenderingServer.SetDefaultClearColor(view.SkyColor);
+    }
+    private void StartSeparateWorld()
+    {
+        _input.SetLoading(true); _saveAllowed=false;
+        try
+        {
+            int slot=Enumerable.Range(1,SaveSlotService.SlotCount).FirstOrDefault(_slots.IsEmpty);
+            if(slot>0)
+            {
+                _savePath=_slots.PathForSlot(slot); _settings.LastSlot=slot; SaveSettings();
+            }
+            else
+            {
+                _savePath=SaveGameStore.NewSeparateWorldPath(_originalPath);
+                IOFile.WriteAllText(_selectorPath,Path.GetFileName(_savePath));
+            }
+            StartSession(GameSessionState.CreateNormalStarter(DefaultSeed));
+            _saveAllowed=true; _dirty=true;
+            if(!SaveSession()) { _saveAllowed=false; _hud.ShowLoadError("Could not save the separate world. Original files remain untouched."); return; }
+            _hud.CloseForTransition(); _hud.SetHudVisible(true); _shell.HideShell(); _input.SetLoading(false);
+            _hud.ShowNotification(slot>0?$"Recovery world created in Slot {slot}. Original files were left untouched.":"Separate recovery world created. Original save and backup were left untouched.");
+            GD.Print("Separate world: "+_savePath);
+        }
+        catch(Exception e) { _hud.ShowLoadError(e.Message); GD.PushError(e.ToString()); }
+    }
+    private void CancelTransientActions()
+    { _harvest?.CancelActions(); _building?.CancelActions(); _bear?.CancelMotion(); }
+    public override void _PhysicsProcess(double delta)
+    {
+        if(_input is null || _input.BlocksWorld || _session is null || _island is null) return;
+        _bear.ClimbEnabled=_island.Queries.IsLadder(IslandView.Point(_bear.Position));
+        bool changed=_simulation.Advance(_session,new WorldSeed(_session.Seed),_generator,delta);
+        _dirty=true;
+        if(changed) { _island.QueueRedraw(); UpdateHud(); }
+        _autosave+=delta;
+        if(_autosave>=10) { _autosave=0; SaveSession(); }
+    }
+    public override void _Process(double delta)
+    {
+        if(_bear is not null && _backdrop is not null)
+        {
+            var camera=_bear.GetNodeOrNull<Camera2D>("Camera");
+            if(camera is not null) _backdrop.SetCameraX(camera.GetScreenCenterPosition().X);
+        }
+        // Saving a completed UI transaction is allowed while simulation is paused.
+        if(_saveDelay>=0)
+        {
+            _saveDelay-=delta;
+            if(_saveDelay<0 && _dirty) SaveSession();
+        }
+        if(_session is not null && _island is not null && _hud.Context is { } context &&
+            !WorldActions.ValidateEntity(_island.Queries,_session.CurrentIslandId,IslandView.Point(_bear!.Position),context,out _,out _,out _))
+        { _hud.HidePanels(); _hud.ShowNotification("That object is no longer in reach."); }
+        if(_session is not null && _island is not null && _hud.TradeOpen && _hud.ResidentContext is { } residentId &&
+            !ResidentService.CanInteract(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear!.Position),residentId,out _,out _))
+        { _hud.HidePanels(); _hud.ShowNotification("That resident is no longer in reach."); }
+        if(_session is not null && _island is not null && _hud.WorkerOpen && _hud.ResidentContext is { } workerResidentId &&
+            !ResidentService.CanInteract(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear!.Position),workerResidentId,out _,out _))
+        { _hud.HidePanels(); _hud.ShowNotification("That worker is no longer in reach."); }
+    }
+    private void Changed()
+    { _dirty=true; _saveDelay=0.75; _hud.RefreshInventory(); _hud.RefreshResidents(); UpdateHud(); }
+    private void Craft(string id)
+    {
+        if(_session is null || !_hud.CraftingOpen) return;
+        var recipe=CraftingCatalog.Find(id);
+        if(recipe is null) return;
+        if(!InventoryTransactions.TryExchange(_session.Inventory,recipe.Cost,recipe.Result,1,out var reason))
+        { _hud.ShowNotification(reason); return; }
+        Changed(); _hud.ShowNotification("Crafted "+recipe.DisplayName+".");
+    }
+    private void CraftAtStation(WorldEntityRef id,string recipeId,ItemType? flower)
+    {
+        if(_session is null || _island is null || !_hud.StationOpen || _hud.Context!=id) return;
+        if(WorldActions.TryStation(_island.Queries,_session.CurrentIslandId,_session.Inventory,IslandView.Point(_bear.Position),id,recipeId,flower,out var reason))
+        { Changed(); _hud.ShowNotification("Recipe completed."); } else _hud.ShowNotification(reason);
+    }
+    private void OpenEntity(WorldEntityRef id)
+    {
+        if(_session is null || _island is null || _input.BlocksWorld) return;
+        var actor=IslandView.Point(_bear.Position);
+        if(!WorldActions.ValidateEntity(_island.Queries,_session.CurrentIslandId,actor,id,out var placed,out var chest,out var reason))
+        { _hud.ShowNotification(reason); return; }
+        if(chest is not null || placed?.Item==ItemType.Chest)
+        {
+            if(!WorldActions.TryStorage(_island.Queries,_session.CurrentIslandId,actor,id,out var contents,out bool takeOnly,out reason)) return;
+            _hud.OpenStorage(id,contents!,takeOnly); _dirty=true; _saveDelay=0.75;
+        }
+        else if(placed is not null) _hud.OpenStation(id,placed.Item);
+    }
+    private void Transfer(WorldEntityRef id,bool deposit,ItemType? item,int amount)
+    {
+        if(_session is null || _island is null || !_hud.StorageOpen || _hud.Context!=id) return;
+        if(WorldActions.TryTransfer(_island.Queries,_session.CurrentIslandId,_session.Inventory,IslandView.Point(_bear.Position),id,deposit,item,amount,out var reason))
+        { Changed(); _island.QueueRedraw(); } else _hud.ShowNotification(reason);
+    }
+    private void OpenResident(int residentId)
+    {
+        if(_session is null || _island is null || _input.BlocksWorld) return;
+        if(!ResidentService.CanInteract(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear.Position),residentId,out var resident,out var reason) || resident is null)
+        { _hud.ShowNotification(reason); return; }
+        _hud.OpenResident(resident);
+    }
+
+    private void TradeWithResident(int residentId,string offerId)
+    {
+        if(_session is null || _island is null || !_hud.TradeOpen || _hud.ResidentContext!=residentId) return;
+        if(!ResidentService.CanInteract(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear.Position),residentId,out var resident,out var reason) || resident is null)
+        { _hud.HidePanels(); _hud.ShowNotification(reason); return; }
+        if(ResidentTradingService.TryTrade(resident,_session.Inventory,offerId,out reason))
+        { Changed(); _island.QueueRedraw(); _hud.ShowNotification(reason); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void InviteResident(int residentId)
+    {
+        if(_session is null || _island is null || !_hud.TradeOpen || _hud.ResidentContext!=residentId) return;
+        if(ResidentService.TryMoveToRoster(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear.Position),residentId,out var reason))
+        { _hud.HidePanels(); Changed(); _island.QueueRedraw(); _hud.ShowNotification(reason); UpdateMap(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void ClaimSpecialRewardWorld(int residentId)
+    {
+        if(_session is null || _island is null || _input.BlocksWorld) return;
+        if(!ResidentService.CanInteract(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear.Position),residentId,out var resident,out var reason) || resident is null)
+        { _hud.ShowNotification(reason); return; }
+        if(ResidentTradingService.TryClaimSpecialReward(resident,_session.Inventory,out reason))
+        { Changed(); _island.QueueRedraw(); _hud.ShowNotification(reason); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void ClaimSpecialReward(int residentId)
+    {
+        if(_session is null || _island is null || !_hud.TradeOpen || _hud.ResidentContext!=residentId) return;
+        if(!ResidentService.CanInteract(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear.Position),residentId,out var resident,out var reason) || resident is null)
+        { _hud.ShowNotification(reason); return; }
+        if(ResidentTradingService.TryClaimSpecialReward(resident,_session.Inventory,out reason))
+        { Changed(); _island.QueueRedraw(); _hud.ShowNotification(reason); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void PlaceFriend(int residentId)
+    {
+        if(_session is null || _island is null || !_hud.FriendsOpen) return;
+        if(ResidentService.TryPlaceFromRoster(_session,_island.Queries,IslandView.Point(_bear.Position),residentId,out var reason))
+        { Changed(); _island.QueueRedraw(); _hud.ShowNotification(reason); UpdateMap(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void OpenWorker(int residentId)
+    {
+        if(_session is null || _island is null || !_hud.TradeOpen || _hud.ResidentContext!=residentId) return;
+        if(!ResidentService.CanInteract(_session,_island.Definition,_session.CurrentIslandId,IslandView.Point(_bear.Position),residentId,out var resident,out var reason) || resident is null)
+        { _hud.ShowNotification(reason); return; }
+        if(!WorkerService.CanWork(resident)) { _hud.ShowNotification("Reach 100 friendship with an ordinary bear first."); return; }
+        var chests=_island.State.PlacedObjects.Where(p=>p.Item==ItemType.Chest).OrderBy(p=>p.PlacementId).ToArray();
+        _hud.OpenWorker(resident,chests);
+    }
+
+    private void AssignWorkerChest(int residentId,int chestPlacementId)
+    {
+        if(_session is null || _island is null || !_hud.WorkerOpen || _hud.ResidentContext!=residentId) return;
+        if(WorkerService.TryAssign(_session,_island.Queries,residentId,chestPlacementId,out var reason))
+        { Changed(); _island.QueueRedraw(); _hud.ShowNotification(reason); _hud.RefreshResidents(); UpdateMap(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void CycleWorkerPriority(int residentId,WorkerJob job)
+    {
+        if(_session is null || !_hud.WorkerOpen || _hud.ResidentContext!=residentId) return;
+        if(WorkerService.TryCyclePriority(_session,residentId,job,out var reason))
+        { Changed(); _hud.ShowNotification(reason); _hud.RefreshResidents(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void SetWorkerRadius(int residentId,int radius)
+    {
+        if(_session is null || !_hud.WorkerOpen || _hud.ResidentContext!=residentId) return;
+        if(WorkerService.TrySetRadius(_session,residentId,radius,out var reason))
+        { Changed(); _hud.ShowNotification(reason); _hud.RefreshResidents(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void ToggleWorkerProtection(int residentId)
+    {
+        if(_session is null || !_hud.WorkerOpen || _hud.ResidentContext!=residentId) return;
+        if(WorkerService.TryToggleProtection(_session,residentId,out var reason))
+        { Changed(); _hud.ShowNotification(reason); _hud.RefreshResidents(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void StopWorker(int residentId)
+    {
+        if(_session is null || !_hud.WorkerOpen || _hud.ResidentContext!=residentId) return;
+        if(WorkerService.TryStop(_session,residentId,out var reason))
+        { Changed(); _island?.QueueRedraw(); _hud.ShowNotification(reason); _hud.RefreshResidents(); UpdateMap(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void RecallWorker(int residentId)
+    {
+        if(_session is null || !_hud.WorkerOpen || _hud.ResidentContext!=residentId) return;
+        if(WorkerService.TryRecall(_session,residentId,out var reason))
+        { _hud.HidePanels(); Changed(); _island?.QueueRedraw(); _hud.ShowNotification(reason); UpdateMap(); }
+        else _hud.ShowNotification(reason);
+    }
+
+    private void QueueTravel(BoatSide side)
+    {
+        if(_session is null || _island is null || _input.BlocksWorld) return;
+        _input.SetTransition(true);
+        Callable.From(()=>Travel(side)).CallDeferred();
+    }
+    private void Travel(BoatSide side)
+    {
+        IslandView? staged=null;
+        var origin=_island;
+        var originPosition=_bear.Position;
+        bool committed=false;
+        try
+        {
+            if(_session is null || origin is null) return;
+            // Revalidate both ID and physical departure range even if a stale callback was queued.
+            var actor=IslandView.Point(_bear.Position);
+            var shore=IslandView.Point(origin.GetBoatSiteCenter(side));
+            var boat=WorldGrid.BoatHull(origin.Definition.WidthCells,side).Center;
+            if(!origin.Queries.InReach(actor,shore,WorldActions.InteractionRange) && !origin.Queries.InReach(actor,boat,WorldActions.InteractionRange))
+                throw new InvalidOperationException("Departure point is out of reach.");
+            var prepared=TravelService.Prepare(_session,side,id=>_generator.Generate(new WorldSeed(_session.Seed),id));
+            staged=new IslandView(prepared.Definition,prepared.State,_session.Residents) {Name=$"Island_{prepared.DestinationId}"};
+            staged.PreparePhysics(); staged.RefreshBoatCollision(prepared.ArrivalSide); AddChild(staged);
+            // All preparation/physics setup succeeds before the source scene or session is removed.
+            BindWorld(staged,prepared.Spawn);
+            TravelService.Commit(_session,prepared);
+            committed=true;
+            ResidentService.EnsureForIsland(_session,prepared.Definition);
+            _island=staged; staged=null;
+            _hud.CloseForTransition();
+            RemoveChild(origin); origin.QueueFree();
+            Changed(); UpdateMap(); SaveSession();
+            _hud.ShowNotification($"Arrived on island {_session.CurrentIslandId}.");
+        }
+        catch(Exception e)
+        {
+            if(!committed)
+            {
+                if(staged is not null) { if(staged.GetParent() is not null) RemoveChild(staged); staged.QueueFree(); }
+                if(origin is not null && _session is not null) { _island=origin; BindWorld(origin,IslandView.Point(originPosition)); }
+                _hud.ShowNotification("Travel cancelled; origin retained. "+e.Message);
+            }
+            else
+            {
+                // Never roll back only the scene after a successful domain commit.
+                // Post-commit presentation errors retain the complete destination session.
+                if(origin is not null && GodotObject.IsInstanceValid(origin) && origin.GetParent()==this)
+                { RemoveChild(origin); origin.QueueFree(); }
+                _dirty=true; _saveDelay=0;
+                _hud.ShowNotification("Arrived, but the interface could not refresh: "+e.Message);
+            }
+            GD.PushError(e.ToString());
+        }
+        finally { _input.SetTransition(false); }
+    }
+    private void UpdateHud()
+    {
+        if(_session is not null && _island is not null)
+        {
+            _hud.SetIslandInfo(_session.Seed,_island.Definition,_island.RemainingNaturalFeatureCount);
+            _hud.SetProgressionHint(ProgressionService.GetContextHint(_session,_island.Definition));
+        }
+    }
+    private IReadOnlyList<DiscoveryMapEntry> BuildMapEntries()
+    {
+        if(_session is null || _island is null) return Array.Empty<DiscoveryMapEntry>();
+        return DiscoveryMapService.Build(_session,_generator,CurrentDockInReach());
+    }
+
+    private BoatSide? CurrentDockInReach()
+    {
+        if(_session is null || _island is null || !GodotObject.IsInstanceValid(_bear)) return null;
+        WorldPoint actor=IslandView.Point(_bear.Position);
+        BoatSide? best=null;
+        double bestDistance=double.PositiveInfinity;
+
+        foreach(var side in Enum.GetValues<BoatSide>())
+        {
+            if(!_island.State.IsBoatBuilt(side)) continue;
+            WorldPoint shore=IslandView.Point(_island.GetBoatSiteCenter(side));
+            WorldPoint hull=WorldGrid.BoatHull(_island.Definition.WidthCells,side).Center;
+            double distance=Math.Min(actor.DistanceSquared(shore),actor.DistanceSquared(hull));
+            if(distance<=WorldActions.InteractionRange*WorldActions.InteractionRange && distance<bestDistance)
+            { best=side; bestDistance=distance; }
+        }
+        return best;
+    }
+
+    private void UpdateMap()
+    {
+        // The map is provider-driven so source-dock range and production status are
+        // evaluated at the moment it is rendered. SetMapText remains a cheap refresh hook.
+        _hud.SetMapText(string.Empty);
+    }
+
+    private void QueueMapTravel(int destinationId)
+    {
+        if(_session is null || _island is null || !_hud.AnyPanelOpen) return;
+        _input.SetTransition(true);
+        Callable.From(()=>MapTravel(destinationId)).CallDeferred();
+    }
+
+    private void MapTravel(int destinationId)
+    {
+        IslandView? staged=null;
+        IslandView? origin=_island;
+        Vector2 originPosition=_bear.Position;
+        bool committed=false;
+
+        try
+        {
+            if(_session is null || origin is null) return;
+            BoatSide? departure=CurrentDockInReach();
+            if(!departure.HasValue) throw new InvalidOperationException("Stand beside a completed source dock.");
+
+            var entries=DiscoveryMapService.Build(_session,_generator,departure);
+            DiscoveryMapEntry? entry=entries.FirstOrDefault(e=>e.IslandId==destinationId);
+            if(entry is null || !entry.CanTravel || !entry.ArrivalSide.HasValue)
+                throw new InvalidOperationException(entry?.TravelReason ?? "Destination is not available.");
+
+            var prepared=TravelService.PrepareDirect(
+                _session,departure.Value,destinationId,entry.ArrivalSide.Value,
+                id=>_generator.Generate(new WorldSeed(_session.Seed),id));
+
+            staged=new IslandView(prepared.Definition,prepared.State,_session.Residents)
+            { Name=$"Island_{prepared.DestinationId}" };
+            staged.PreparePhysics();
+            AddChild(staged);
+
+            BindWorld(staged,prepared.Spawn);
+            TravelService.Commit(_session,prepared);
+            committed=true;
+            ResidentService.EnsureForIsland(_session,prepared.Definition);
+            _island=staged; staged=null;
+            _hud.CloseForTransition();
+            RemoveChild(origin); origin.QueueFree();
+            Changed(); UpdateMap(); SaveSession();
+            _hud.ShowNotification($"Travelled to island {_session.CurrentIslandId}.");
+        }
+        catch(Exception e)
+        {
+            if(!committed)
+            {
+                if(staged is not null)
+                { if(staged.GetParent() is not null) RemoveChild(staged); staged.QueueFree(); }
+                if(origin is not null && _session is not null)
+                { _island=origin; BindWorld(origin,IslandView.Point(originPosition)); }
+                _hud.ShowNotification("Map travel cancelled; origin retained. "+e.Message);
+            }
+            else
+            {
+                if(origin is not null && GodotObject.IsInstanceValid(origin) && origin.GetParent()==this)
+                { RemoveChild(origin); origin.QueueFree(); }
+                _dirty=true; _saveDelay=0;
+                _hud.ShowNotification("Arrived, but the interface could not refresh: "+e.Message);
+            }
+            GD.PushError(e.ToString());
+        }
+        finally { _input.SetTransition(false); }
+    }
+
+    private bool SaveSession()
+    {
+        if(!_saveAllowed || _session is null) return false;
+        try
+        {
+            if(GodotObject.IsInstanceValid(_bear))
+                _session.PlayerLocation=new(_session.CurrentIslandId,_bear.Position.X,_bear.Position.Y);
+            _saves.Save(_savePath,GameSaveData.FromSession(_session)); _dirty=false; _saveDelay=-1; return true;
+        }
+        catch(Exception e)
+        {
+            GD.PushError("Save failed; previous files retained. "+e);
+            if(GodotObject.IsInstanceValid(_hud)) _hud.ShowNotification("SAVE FAILED — previous save retained. See Godot output.");
+            _saveDelay=-1; return false;
+        }
+    }
+    private void RequestQuit()
+    {
+        if(_quitting) return;
+        if(_saveAllowed && !SaveSession()) { _hud.ShowPause("Save failed. Resume and retry; previous save was retained."); return; }
+        _quitting=true; GetTree().Quit();
+    }
+    public override void _Notification(int what)
+    { if(what==NotificationWMCloseRequest && _hud is not null) RequestQuit(); }
+    public override void _ExitTree()
+    { if(!_quitting && _saveAllowed) SaveSession(); }
 }
